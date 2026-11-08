@@ -1,0 +1,633 @@
+//! `term` — the terminal state machine.
+//!
+//! This is the Rust equivalent of Ghostty's Zig `src/terminal` + `src/vt`:
+//! it owns the screen grid and implements `vte::Perform` so the `vte` crate
+//! can drive it with parsed escape sequences.
+
+use unicode_width::UnicodeWidthChar;
+use vte::{Params, Perform};
+
+pub const DEFAULT_FG: [u8; 3] = [0xcc, 0xcc, 0xcc];
+pub const DEFAULT_BG: [u8; 3] = [0x0c, 0x0c, 0x0c];
+
+/// Standard 16-color ANSI palette (xterm-ish defaults).
+pub const PALETTE: [[u8; 3]; 16] = [
+    [0x00, 0x00, 0x00],
+    [0xaa, 0x00, 0x00],
+    [0x00, 0xaa, 0x00],
+    [0xaa, 0x85, 0x00],
+    [0x00, 0x00, 0xaa],
+    [0xaa, 0x00, 0xaa],
+    [0x00, 0xaa, 0xaa],
+    [0xaa, 0xaa, 0xaa],
+    [0x55, 0x55, 0x55],
+    [0xff, 0x55, 0x55],
+    [0x55, 0xff, 0x55],
+    [0xff, 0xff, 0x55],
+    [0x55, 0x55, 0xff],
+    [0xff, 0x55, 0xff],
+    [0x55, 0xff, 0xff],
+    [0xff, 0xff, 0xff],
+];
+
+/// A single grid cell.
+///
+/// `ch == '\0'` marks the right half of a double-width character; the renderer
+/// skips it so the wide glyph can advance across two columns.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Cell {
+    pub ch: char,
+    pub fg: [u8; 3],
+    pub bg: [u8; 3],
+    pub bold: bool,
+    pub underline: bool,
+}
+
+impl Default for Cell {
+    fn default() -> Self {
+        Self {
+            ch: ' ',
+            fg: DEFAULT_FG,
+            bg: DEFAULT_BG,
+            bold: false,
+            underline: false,
+        }
+    }
+}
+
+impl Cell {
+    fn blank(fg: [u8; 3], bg: [u8; 3]) -> Self {
+        Self {
+            ch: ' ',
+            fg,
+            bg,
+            bold: false,
+            underline: false,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SavedScreen {
+    cells: Vec<Cell>,
+    cx: usize,
+    cy: usize,
+}
+
+pub struct Term {
+    pub cols: usize,
+    pub rows: usize,
+    cells: Vec<Cell>,
+    cx: usize,
+    cy: usize,
+    fg: [u8; 3],
+    bg: [u8; 3],
+    bold: bool,
+    underline: bool,
+    inverse: bool,
+    wrap_pending: bool,
+    /// Alternate-screen buffer (DEC set 47/1047/1049).
+    saved: Option<SavedScreen>,
+    /// Cursor saved by DECSC (ESC 7) / restored by DECRC (ESC 8).
+    saved_cursor: Option<(usize, usize)>,
+    pub cursor_visible: bool,
+    pub app_cursor_keys: bool,
+    pub title: Option<String>,
+    responses: Vec<Vec<u8>>,
+    dirty: bool,
+}
+
+impl Term {
+    pub fn new(cols: usize, rows: usize) -> Self {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        Self {
+            cols,
+            rows,
+            cells: vec![Cell::default(); cols * rows],
+            cx: 0,
+            cy: 0,
+            fg: DEFAULT_FG,
+            bg: DEFAULT_BG,
+            bold: false,
+            underline: false,
+            inverse: false,
+            wrap_pending: false,
+            saved: None,
+            saved_cursor: None,
+            cursor_visible: true,
+            app_cursor_keys: false,
+            title: None,
+            responses: Vec::new(),
+            dirty: true,
+        }
+    }
+
+    /// Feed raw PTY bytes through the parser.
+    pub fn feed(&mut self, parser: &mut vte::Parser, bytes: &[u8]) {
+        for &b in bytes {
+            parser.advance(self, b);
+        }
+        self.dirty = true;
+    }
+
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
+
+    pub fn take_responses(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.responses)
+    }
+
+    pub fn cell(&self, x: usize, y: usize) -> &Cell {
+        &self.cells[y * self.cols + x]
+    }
+
+    pub fn cursor(&self) -> (usize, usize) {
+        (self.cx, self.cy)
+    }
+
+    pub fn resize(&mut self, cols: usize, rows: usize) {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        if cols == self.cols && rows == self.rows {
+            return;
+        }
+        let mut next = vec![Cell::default(); cols * rows];
+        // Preserve top-left content; proper reflow is future work.
+        for y in 0..rows.min(self.rows) {
+            for x in 0..cols.min(self.cols) {
+                next[y * cols + x] = self.cells[y * self.cols + x];
+            }
+        }
+        self.cells = next;
+        self.cols = cols;
+        self.rows = rows;
+        self.cx = self.cx.min(cols - 1);
+        self.cy = self.cy.min(rows - 1);
+        self.wrap_pending = false;
+        self.dirty = true;
+    }
+
+    fn idx(&self, x: usize, y: usize) -> usize {
+        y * self.cols + x
+    }
+
+    fn scroll_up(&mut self, count: usize) {
+        let n = count.min(self.rows);
+        if n == 0 {
+            return;
+        }
+        self.cells.copy_within(n * self.cols.., 0);
+        for c in self.cells[(self.rows - n) * self.cols..].iter_mut() {
+            *c = Cell::default();
+        }
+    }
+
+    fn scroll_down(&mut self, count: usize) {
+        let n = count.min(self.rows);
+        if n == 0 {
+            return;
+        }
+        self.cells
+            .copy_within(..(self.rows - n) * self.cols, n * self.cols);
+        for c in self.cells[..n * self.cols].iter_mut() {
+            *c = Cell::default();
+        }
+    }
+
+    fn clear_row(&mut self, y: usize, from: usize, to: usize) {
+        let to = to.min(self.cols);
+        for x in from..to {
+            let i = self.idx(x, y);
+            self.cells[i] = Cell::blank(self.fg, self.bg);
+        }
+    }
+
+    fn linefeed(&mut self) {
+        if self.cy + 1 < self.rows {
+            self.cy += 1;
+        } else {
+            self.scroll_up(1);
+        }
+        self.wrap_pending = false;
+    }
+
+    fn put_char(&mut self, c: char) {
+        let width = c.width().unwrap_or(1).max(1);
+        if width > self.cols {
+            return;
+        }
+        if self.wrap_pending || self.cx + width > self.cols {
+            self.cx = 0;
+            self.linefeed();
+        }
+        // SGR 7 swaps the pen colors for the duration of the attribute.
+        let (fg, bg) = if self.inverse {
+            (self.bg, self.fg)
+        } else {
+            (self.fg, self.bg)
+        };
+        let i = self.idx(self.cx, self.cy);
+        self.cells[i] = Cell {
+            ch: c,
+            fg,
+            bg,
+            bold: self.bold,
+            underline: self.underline,
+        };
+        // Wide characters occupy a continuation cell that the renderer skips.
+        if width == 2 && self.cx + 1 < self.cols {
+            let j = self.idx(self.cx + 1, self.cy);
+            self.cells[j] = Cell {
+                ch: '\0',
+                fg,
+                bg,
+                bold: self.bold,
+                underline: self.underline,
+            };
+        }
+        let next = self.cx + width;
+        if next >= self.cols {
+            self.cx = self.cols - 1;
+            self.wrap_pending = true;
+        } else {
+            self.cx = next;
+        }
+    }
+
+    fn sgr(&mut self, p: &[u16]) {
+        if p.is_empty() {
+            self.reset_pen();
+            return;
+        }
+        let mut i = 0;
+        while i < p.len() {
+            match p[i] {
+                0 => self.reset_pen(),
+                1 => self.bold = true,
+                4 => self.underline = true,
+                7 => self.inverse = true,
+                22 => self.bold = false,
+                24 => self.underline = false,
+                27 => self.inverse = false,
+                30..=37 => self.fg = PALETTE[(p[i] - 30) as usize],
+                40..=47 => self.bg = PALETTE[(p[i] - 40) as usize],
+                39 => self.fg = DEFAULT_FG,
+                49 => self.bg = DEFAULT_BG,
+                90..=97 => self.fg = PALETTE[(p[i] - 90 + 8) as usize],
+                100..=107 => self.bg = PALETTE[(p[i] - 100 + 8) as usize],
+                38 | 48 => {
+                    let is_fg = p[i] == 38;
+                    if p.get(i + 1) == Some(&5) && i + 2 < p.len() {
+                        let color = xterm_256(p[i + 2]);
+                        if is_fg {
+                            self.fg = color
+                        } else {
+                            self.bg = color
+                        }
+                        i += 2;
+                    } else if p.get(i + 1) == Some(&2) && i + 4 < p.len() {
+                        let color = [p[i + 2] as u8, p[i + 3] as u8, p[i + 4] as u8];
+                        if is_fg {
+                            self.fg = color
+                        } else {
+                            self.bg = color
+                        }
+                        i += 4;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+
+    fn reset_pen(&mut self) {
+        self.fg = DEFAULT_FG;
+        self.bg = DEFAULT_BG;
+        self.bold = false;
+        self.underline = false;
+        self.inverse = false;
+    }
+
+    fn set_private_mode(&mut self, mode: u16, enabled: bool) {
+        match mode {
+            1 => self.app_cursor_keys = enabled,
+            25 => self.cursor_visible = enabled,
+            47 | 1047 | 1049 => {
+                if enabled {
+                    if self.saved.is_none() {
+                        self.saved = Some(SavedScreen {
+                            cells: self.cells.clone(),
+                            cx: self.cx,
+                            cy: self.cy,
+                        });
+                    }
+                    if mode == 1049 || mode == 1047 {
+                        self.cells.iter_mut().for_each(|c| *c = Cell::default());
+                        self.cx = 0;
+                        self.cy = 0;
+                    }
+                } else if let Some(s) = self.saved.take() {
+                    self.cells = s.cells;
+                    self.cx = s.cx.min(self.cols - 1);
+                    self.cy = s.cy.min(self.rows - 1);
+                }
+                self.dirty = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn xterm_256(n: u16) -> [u8; 3] {
+    let n = n as usize;
+    if n < 16 {
+        return PALETTE[n];
+    }
+    if n < 232 {
+        let n = n - 16;
+        let r = (n / 36) as u8;
+        let g = ((n % 36) / 6) as u8;
+        let b = (n % 6) as u8;
+        let scale = |v: u8| -> u8 {
+            if v == 0 {
+                0
+            } else {
+                55 + v * 40
+            }
+        };
+        return [scale(r), scale(g), scale(b)];
+    }
+    let v = 8 + ((n - 232) as u8) * 10;
+    [v, v, v]
+}
+
+impl Perform for Term {
+    fn print(&mut self, c: char) {
+        self.put_char(c);
+    }
+
+    fn execute(&mut self, byte: u8) {
+        match byte {
+            b'\n' | 0x0b | 0x0c => self.linefeed(),
+            b'\r' => {
+                self.cx = 0;
+                self.wrap_pending = false;
+            }
+            b'\t' => {
+                let next = ((self.cx / 8) + 1) * 8;
+                self.cx = next.min(self.cols - 1);
+                self.wrap_pending = false;
+            }
+            0x08 => {
+                if self.cx > 0 {
+                    self.cx -= 1;
+                }
+                self.wrap_pending = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
+        let private = intermediates.first() == Some(&b'?');
+        let p: Vec<u16> = params
+            .iter()
+            .map(|s| s.first().copied().unwrap_or(0))
+            .collect();
+        let arg = |i: usize, default: u16| -> usize {
+            match p.get(i).copied() {
+                Some(0) | None => default as usize,
+                Some(v) => v as usize,
+            }
+        };
+
+        match action {
+            'm' => self.sgr(&p),
+            'h' | 'l' if private => {
+                let enabled = action == 'h';
+                for mode in &p {
+                    self.set_private_mode(*mode, enabled);
+                }
+            }
+            'H' | 'f' => {
+                self.cy = arg(0, 1).saturating_sub(1).min(self.rows - 1);
+                self.cx = arg(1, 1).saturating_sub(1).min(self.cols - 1);
+                self.wrap_pending = false;
+            }
+            'A' => self.cy = self.cy.saturating_sub(arg(0, 1)),
+            'B' => self.cy = (self.cy + arg(0, 1)).min(self.rows - 1),
+            'C' => self.cx = (self.cx + arg(0, 1)).min(self.cols - 1),
+            'D' => self.cx = self.cx.saturating_sub(arg(0, 1)),
+            'E' => {
+                self.cy = (self.cy + arg(0, 1)).min(self.rows - 1);
+                self.cx = 0;
+            }
+            'F' => {
+                self.cy = self.cy.saturating_sub(arg(0, 1));
+                self.cx = 0;
+            }
+            'G' => self.cx = arg(0, 1).saturating_sub(1).min(self.cols - 1),
+            'd' => self.cy = arg(0, 1).saturating_sub(1).min(self.rows - 1),
+            'J' => match p.first().copied().unwrap_or(0) {
+                0 => {
+                    self.clear_row(self.cy, self.cx, self.cols);
+                    for y in self.cy + 1..self.rows {
+                        self.clear_row(y, 0, self.cols);
+                    }
+                }
+                1 => {
+                    for y in 0..self.cy {
+                        self.clear_row(y, 0, self.cols);
+                    }
+                    self.clear_row(self.cy, 0, self.cx + 1);
+                }
+                _ => self.cells.iter_mut().for_each(|c| *c = Cell::default()),
+            },
+            'K' => match p.first().copied().unwrap_or(0) {
+                0 => self.clear_row(self.cy, self.cx, self.cols),
+                1 => self.clear_row(self.cy, 0, self.cx + 1),
+                _ => self.clear_row(self.cy, 0, self.cols),
+            },
+            'L' => {
+                let n = arg(0, 1).min(self.rows - self.cy);
+                let start = self.idx(0, self.cy);
+                self.cells.copy_within(start.., start + n * self.cols);
+                for y in self.cy..self.cy + n {
+                    self.clear_row(y, 0, self.cols);
+                }
+            }
+            'M' => {
+                let n = arg(0, 1).min(self.rows - self.cy);
+                let start = self.idx(0, self.cy);
+                self.cells.copy_within(start + n * self.cols.., start);
+                for y in self.rows - n..self.rows {
+                    self.clear_row(y, 0, self.cols);
+                }
+            }
+            'P' => {
+                let n = arg(0, 1).min(self.cols - self.cx);
+                let row_start = self.idx(0, self.cy);
+                let from = self.idx(self.cx, self.cy);
+                self.cells
+                    .copy_within(from + n..row_start + self.cols, from);
+                self.clear_row(self.cy, self.cols - n, self.cols);
+            }
+            '@' => {
+                let n = arg(0, 1).min(self.cols - self.cx);
+                let row_start = self.idx(0, self.cy);
+                let from = self.idx(self.cx, self.cy);
+                self.cells
+                    .copy_within(from..row_start + self.cols - n, from + n);
+                self.clear_row(self.cy, self.cx, self.cx + n);
+            }
+            'S' => self.scroll_up(arg(0, 1)),
+            'T' => self.scroll_down(arg(0, 1)),
+            'X' => self.clear_row(self.cy, self.cx, self.cx + arg(0, 1)),
+            'n' => match p.first().copied().unwrap_or(0) {
+                6 => {
+                    let response = format!("\x1b[{};{}R", self.cy + 1, self.cx + 1);
+                    self.responses.push(response.into_bytes());
+                }
+                5 => self.responses.push(b"\x1b[0n".to_vec()),
+                _ => {}
+            },
+            'c' => {
+                if p.first().copied().unwrap_or(0) == 0 {
+                    // VT100 with advanced video: "I am a terminal".
+                    let response = b"\x1b[?1;2c".to_vec();
+                    self.responses.push(response);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        // Charset designation (ESC ( 0 etc.): accept and ignore in the MVP.
+        if !intermediates.is_empty() {
+            return;
+        }
+        match byte {
+            b'c' => {
+                // RIS - full reset
+                self.cells.iter_mut().for_each(|c| *c = Cell::default());
+                self.cx = 0;
+                self.cy = 0;
+                self.saved = None;
+                self.saved_cursor = None;
+                self.wrap_pending = false;
+                self.cursor_visible = true;
+                self.app_cursor_keys = false;
+                self.reset_pen();
+            }
+            b'D' => self.linefeed(),
+            b'E' => {
+                self.cx = 0;
+                self.linefeed();
+            }
+            b'M' => {
+                if self.cy > 0 {
+                    self.cy -= 1;
+                } else {
+                    self.scroll_down(1);
+                }
+            }
+            b'7' => {
+                self.saved_cursor = Some((self.cx, self.cy));
+            }
+            b'8' => {
+                if let Some((x, y)) = self.saved_cursor {
+                    self.cx = x.min(self.cols - 1);
+                    self.cy = y.min(self.rows - 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        // OSC 0 / 2 set the window title.
+        if matches!(params.first(), Some(&b"0") | Some(&b"2")) {
+            if let Some(title) = params.get(1) {
+                self.title = Some(String::from_utf8_lossy(title).into_owned());
+                self.dirty = true;
+            }
+        }
+        // TODO: OSC 8 hyperlinks, OSC 52 clipboard, OSC 7 cwd.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row_text(t: &Term, y: usize) -> String {
+        (0..t.cols)
+            .map(|x| t.cell(x, y).ch)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    fn feed(t: &mut Term, s: &str) {
+        let mut parser = vte::Parser::new();
+        t.feed(&mut parser, s.as_bytes());
+    }
+
+    #[test]
+    fn plain_text() {
+        let mut t = Term::new(10, 3);
+        feed(&mut t, "hello");
+        assert_eq!(row_text(&t, 0), "hello");
+        assert_eq!(t.cursor(), (5, 0));
+    }
+
+    #[test]
+    fn crlf_and_wrap() {
+        let mut t = Term::new(4, 3);
+        feed(&mut t, "abcdef\r\nxy");
+        assert_eq!(row_text(&t, 0), "abcd");
+        assert_eq!(row_text(&t, 1), "ef");
+        assert_eq!(row_text(&t, 2), "xy");
+    }
+
+    #[test]
+    fn scrolling() {
+        let mut t = Term::new(4, 2);
+        feed(&mut t, "a\r\nb\r\nc");
+        assert_eq!(row_text(&t, 0), "b");
+        assert_eq!(row_text(&t, 1), "c");
+    }
+
+    #[test]
+    fn colors() {
+        let mut t = Term::new(8, 2);
+        feed(&mut t, "\x1b[31mR\x1b[0mN");
+        assert_eq!(t.cell(0, 0).fg, PALETTE[1]);
+        assert_eq!(t.cell(1, 0).fg, DEFAULT_FG);
+    }
+
+    #[test]
+    fn cursor_position() {
+        let mut t = Term::new(10, 5);
+        feed(&mut t, "\x1b[3;4HX");
+        assert_eq!(t.cell(3, 2).ch, 'X');
+    }
+
+    #[test]
+    fn erase_line() {
+        let mut t = Term::new(10, 2);
+        feed(&mut t, "abcdef\x1b[3D\x1b[K");
+        assert_eq!(row_text(&t, 0), "abc");
+    }
+
+    #[test]
+    fn dsr_response() {
+        let mut t = Term::new(10, 5);
+        feed(&mut t, "\x1b[2;3H\x1b[6n");
+        assert_eq!(t.take_responses(), vec![b"\x1b[2;3R".to_vec()]);
+    }
+}

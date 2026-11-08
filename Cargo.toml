@@ -1,0 +1,30 @@
+[package]
+name = "ghostty-windows"
+version = "0.1.0"
+edition = "2021"
+description = "A pure-Rust terminal emulator for Windows, inspired by Ghostty"
+license = "MIT"
+
+[dependencies]
+# Window + input. Ghostty uses Swift/AppKit on macOS and GTK on Linux.
+winit = "0.30"
+# GPU surface + swapchain. Ghostty uses Metal on macOS and OpenGL on Linux.
+wgpu = "23"
+pollster = "0.4"
+# Text shaping + rasterization. Ghostty uses CoreText on macOS.
+glyphon = "0.7"
+# ConPTY on Windows. Ghostty uses the macOS PTY / Linux pty.
+portable-pty = "0.8"
+# VT/ANSI escape sequence parser. Ghostty has its own Zig parser.
+vte = "0.11"
+# Column width of grapheme clusters (CJK / emoji are double-width).
+unicode-width = "0.2"
+# Raw struct uploads for GPU buffers.
+bytemuck = { version = "1", features = ["derive"] }
+# Clipboard (Ctrl+V paste).
+arboard = "3"
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1
