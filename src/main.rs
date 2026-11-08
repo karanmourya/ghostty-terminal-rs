@@ -15,8 +15,11 @@
 //! source. See README.md for what is implemented and what still needs work
 //! before it can be called a Ghostty replacement.
 
+mod config;
 mod quad;
 mod term;
+
+use config::{Config, CursorStyle};
 
 use std::sync::mpsc::{channel, Receiver, Sender};
 
@@ -39,9 +42,7 @@ use winit::{
 
 use quad::{linear, Quad, QuadRenderer};
 
-const DEFAULT_FONT_SIZE: f32 = 15.0;
 const LINE_HEIGHT_RATIO: f32 = 1.32;
-const PADDING: f32 = 6.0;
 const CURSOR_THICKNESS: f32 = 2.0;
 /// Highlight colour painted behind selected cells.
 const SELECTION_BG: [u8; 3] = [0x58, 0x5e, 0x7a];
@@ -155,14 +156,17 @@ struct Text {
     atlas: TextAtlas,
     renderer: GlyphonRenderer,
     buffer: Option<Buffer>,
+    /// Configured font size before DPI scaling.
+    base_font_size: f32,
     font_size: f32,
+    family: Family<'static>,
     line_height: f32,
     cell_width: f32,
     dirty: bool,
 }
 
 impl Text {
-    fn new(gpu: &Gpu, scale: f32) -> Self {
+    fn new(gpu: &Gpu, scale: f32, config: &Config) -> Self {
         let mut font_system = FontSystem::new();
         let swash = SwashCache::new();
         let cache = Cache::new(&gpu.device);
@@ -175,9 +179,15 @@ impl Text {
             None,
         );
 
-        let font_size = DEFAULT_FONT_SIZE * scale;
+        // One small leak so the family name can be 'static (the app lives for
+        // the whole process, so this is never worth freeing).
+        let family = match &config.font_family {
+            Some(name) => Family::Name(Box::leak(name.clone().into_boxed_str())),
+            None => Family::Monospace,
+        };
+        let font_size = config.font_size * scale;
         let line_height = (font_size * LINE_HEIGHT_RATIO).round();
-        let cell_width = measure_cell(&mut font_system, font_size, line_height);
+        let cell_width = measure_cell(&mut font_system, &family, font_size, line_height);
 
         Self {
             font_system,
@@ -187,7 +197,9 @@ impl Text {
             atlas,
             renderer,
             buffer: None,
+            base_font_size: config.font_size,
             font_size,
+            family,
             line_height,
             cell_width,
             dirty: true,
@@ -195,13 +207,18 @@ impl Text {
     }
 
     fn set_scale(&mut self, scale: f32) {
-        let font_size = DEFAULT_FONT_SIZE * scale;
+        let font_size = self.base_font_size * scale;
         if (font_size - self.font_size).abs() < f32::EPSILON {
             return;
         }
         self.font_size = font_size;
         self.line_height = (font_size * LINE_HEIGHT_RATIO).round();
-        self.cell_width = measure_cell(&mut self.font_system, self.font_size, self.line_height);
+        self.cell_width = measure_cell(
+            &mut self.font_system,
+            &self.family,
+            self.font_size,
+            self.line_height,
+        );
         self.buffer = None;
         self.dirty = true;
     }
@@ -233,7 +250,7 @@ impl Text {
                 // Missing lines (only possible mid-resize) render as blanks.
                 let cell = match line.and_then(|line| line.get(x)) {
                     Some(cell) => *cell,
-                    None => term::Cell::default(),
+                    None => term.blank_cell(),
                 };
                 if cell.ch == '\0' {
                     // Right half of a wide glyph: the glyph itself advances.
@@ -242,14 +259,20 @@ impl Text {
                 let style = (cell.fg, cell.bold, cell.underline);
                 if current != Some(style) {
                     if let Some((fg, bold, underline)) = current {
-                        spans.push((std::mem::take(&mut text), attrs(fg, bold, underline)));
+                        spans.push((
+                            std::mem::take(&mut text),
+                            attrs(fg, bold, underline, &self.family),
+                        ));
                     }
                     current = Some(style);
                 }
                 text.push(cell.ch);
             }
             if let Some((fg, bold, underline)) = current {
-                spans.push((std::mem::take(&mut text), attrs(fg, bold, underline)));
+                spans.push((
+                    std::mem::take(&mut text),
+                    attrs(fg, bold, underline, &self.family),
+                ));
             }
             // Terminate the row; cosmic-text creates one layout line per '\n'.
             match spans.last_mut() {
@@ -261,7 +284,7 @@ impl Text {
         buffer.set_rich_text(
             &mut self.font_system,
             spans.iter().map(|(text, attrs)| (text.as_str(), *attrs)),
-            attrs(term::DEFAULT_FG, false, false),
+            attrs(term.foreground(), false, false, &self.family),
             Shaping::Advanced,
         );
         buffer.shape_until_scroll(&mut self.font_system, false);
@@ -271,9 +294,9 @@ impl Text {
     }
 }
 
-fn attrs(fg: [u8; 3], bold: bool, _underline: bool) -> Attrs<'static> {
+fn attrs(fg: [u8; 3], bold: bool, _underline: bool, family: &Family<'static>) -> Attrs<'static> {
     let mut a = Attrs::new()
-        .family(Family::Monospace)
+        .family(*family)
         .color(Color::rgb(fg[0], fg[1], fg[2]));
     if bold {
         a = a.weight(Weight::BOLD);
@@ -283,13 +306,18 @@ fn attrs(fg: [u8; 3], bold: bool, _underline: bool) -> Attrs<'static> {
 
 /// Measure the advance width of the monospace font so the grid, cursor, and
 /// background rectangles line up with the shaped glyphs.
-fn measure_cell(font_system: &mut FontSystem, font_size: f32, line_height: f32) -> f32 {
+fn measure_cell(
+    font_system: &mut FontSystem,
+    family: &Family<'static>,
+    font_size: f32,
+    line_height: f32,
+) -> f32 {
     let mut probe = Buffer::new(font_system, Metrics::new(font_size, line_height));
     probe.set_size(font_system, Some(10_000.0), Some(line_height));
     probe.set_text(
         font_system,
         "MMMMMMMMMM",
-        Attrs::new().family(Family::Monospace),
+        Attrs::new().family(*family),
         Shaping::Advanced,
     );
     probe.shape_until_scroll(font_system, false);
@@ -316,6 +344,7 @@ struct App {
     proxy: Option<EventLoopProxy<UserEvent>>,
 
     term: Term,
+    config: Config,
     parser: vte::Parser,
     pty_writer: Option<Box<dyn std::io::Write + Send>>,
     pty_master: Option<Box<dyn MasterPty + Send>>,
@@ -342,13 +371,26 @@ struct App {
 
 impl App {
     fn new() -> Self {
+        let (config, warnings, path) = config::load();
+        for warning in &warnings {
+            eprintln!("config warning: {warning}");
+        }
+        if let Some(path) = &path {
+            if warnings.is_empty() {
+                eprintln!("loaded config from {}", path.display());
+            }
+        }
+        let mut term = Term::new(80, 24);
+        term.set_theme(config.foreground, config.background, config.palette);
+        term.set_scrollback_limit(config.scrollback);
         Self {
             gpu: None,
             text: None,
             quads: None,
             window: None,
             proxy: None,
-            term: Term::new(80, 24),
+            term,
+            config,
             parser: vte::Parser::new(),
             pty_writer: None,
             pty_master: None,
@@ -372,8 +414,8 @@ impl App {
         let Some(text) = self.text.as_ref() else {
             return (80, 24);
         };
-        let usable_w = (self.width as f32 - PADDING * 2.0).max(text.cell_width);
-        let usable_h = (self.height as f32 - PADDING * 2.0).max(text.line_height);
+        let usable_w = (self.width as f32 - self.config.padding * 2.0).max(text.cell_width);
+        let usable_h = (self.height as f32 - self.config.padding * 2.0).max(text.line_height);
         (
             (usable_w / text.cell_width).floor() as usize,
             (usable_h / text.line_height).floor() as usize,
@@ -432,8 +474,12 @@ impl App {
         let Some(text) = self.text.as_ref() else {
             return (0, 0);
         };
-        let col = ((x as f32 - PADDING) / text.cell_width).floor().max(0.0) as usize;
-        let row = ((y as f32 - PADDING) / text.line_height).floor().max(0.0) as usize;
+        let col = ((x as f32 - self.config.padding) / text.cell_width)
+            .floor()
+            .max(0.0) as usize;
+        let row = ((y as f32 - self.config.padding) / text.line_height)
+            .floor()
+            .max(0.0) as usize;
         (
             col.min(self.term.cols.saturating_sub(1)),
             row.min(self.term.rows.saturating_sub(1)),
@@ -805,6 +851,7 @@ impl App {
         let rows = self.term.rows;
         let cell_w = text.cell_width;
         let line_h = text.line_height;
+        let padding = self.config.padding;
 
         if text.dirty || text.buffer.is_none() {
             text.rebuild(&self.term, self.scroll, surface_width, surface_height);
@@ -819,11 +866,11 @@ impl App {
                 let Some(cell) = line.and_then(|line| line.get(x)) else {
                     continue;
                 };
-                if cell.bg != term::DEFAULT_BG {
+                if cell.bg != self.term.background() {
                     instances.push(Quad {
                         rect: [
-                            PADDING + x as f32 * cell_w,
-                            PADDING + y as f32 * line_h,
+                            padding + x as f32 * cell_w,
+                            padding + y as f32 * line_h,
                             cell_w,
                             line_h,
                         ],
@@ -834,8 +881,8 @@ impl App {
                 if cell.underline {
                     instances.push(Quad {
                         rect: [
-                            PADDING + x as f32 * cell_w,
-                            PADDING + y as f32 * line_h + line_h - 2.5,
+                            padding + x as f32 * cell_w,
+                            padding + y as f32 * line_h + line_h - 2.5,
                             cell_w,
                             1.5,
                         ],
@@ -868,8 +915,8 @@ impl App {
                 }
                 instances.push(Quad {
                     rect: [
-                        PADDING + first as f32 * cell_w,
-                        PADDING + y as f32 * line_h,
+                        padding + first as f32 * cell_w,
+                        padding + y as f32 * line_h,
                         (last - first + 1) as f32 * cell_w,
                         line_h,
                     ],
@@ -883,12 +930,12 @@ impl App {
         // scrolled away from the live screen (like Ghostty's overlay).
         let history = self.term.scrollback_len();
         if history > 0 && self.scroll > 0 {
-            let track_x = surface_width - PADDING - 4.0;
+            let track_x = surface_width - padding - 4.0;
             let track_h = rows as f32 * line_h;
-            let track_y = PADDING;
+            let track_y = padding;
             instances.push(Quad {
                 rect: [track_x, track_y, 4.0, track_h],
-                color: linear(term::DEFAULT_FG, 0.10),
+                color: linear(self.term.foreground(), 0.10),
             });
             let visible_ratio = rows as f32 / self.term.total_lines() as f32;
             let thumb_h = (track_h * visible_ratio).max(24.0).min(track_h);
@@ -896,35 +943,45 @@ impl App {
             let pos = 1.0 - (self.scroll as f32 / history as f32);
             instances.push(Quad {
                 rect: [track_x, track_y + travel * pos, 4.0, thumb_h],
-                color: linear(term::DEFAULT_FG, 0.45),
+                color: linear(self.term.foreground(), 0.45),
             });
         }
 
         let cursor_visible = self.term.cursor_visible && self.scroll == 0 && window.has_focus();
         if cursor_visible {
             let (cx, cy) = self.term.cursor();
-            let x = PADDING + cx as f32 * cell_w;
-            let y = PADDING + cy as f32 * line_h;
-            let color = linear(term::DEFAULT_FG, 0.9);
+            let x = padding + cx as f32 * cell_w;
+            let y = padding + cy as f32 * line_h;
+            let color = linear(self.term.foreground(), 0.9);
             let t = CURSOR_THICKNESS;
-            instances.extend_from_slice(&[
-                Quad {
-                    rect: [x, y, cell_w, t],
-                    color,
-                },
-                Quad {
-                    rect: [x, y + line_h - t, cell_w, t],
-                    color,
-                },
-                Quad {
+            match self.config.cursor_style {
+                CursorStyle::Block => instances.extend_from_slice(&[
+                    Quad {
+                        rect: [x, y, cell_w, t],
+                        color,
+                    },
+                    Quad {
+                        rect: [x, y + line_h - t, cell_w, t],
+                        color,
+                    },
+                    Quad {
+                        rect: [x, y, t, line_h],
+                        color,
+                    },
+                    Quad {
+                        rect: [x + cell_w - t, y, t, line_h],
+                        color,
+                    },
+                ]),
+                CursorStyle::Bar => instances.push(Quad {
                     rect: [x, y, t, line_h],
                     color,
-                },
-                Quad {
-                    rect: [x + cell_w - t, y, t, line_h],
+                }),
+                CursorStyle::Underline => instances.push(Quad {
+                    rect: [x, y + line_h - t, cell_w, t],
                     color,
-                },
-            ]);
+                }),
+            }
         }
         let total = instances.len() as u32;
 
@@ -952,8 +1009,8 @@ impl App {
             &text.viewport,
             [TextArea {
                 buffer,
-                left: PADDING,
-                top: PADDING,
+                left: padding,
+                top: padding,
                 scale: 1.0,
                 bounds: TextBounds {
                     left: 0,
@@ -962,9 +1019,9 @@ impl App {
                     bottom: gpu.config.height as i32,
                 },
                 default_color: Color::rgb(
-                    term::DEFAULT_FG[0],
-                    term::DEFAULT_FG[1],
-                    term::DEFAULT_FG[2],
+                    self.term.foreground()[0],
+                    self.term.foreground()[1],
+                    self.term.foreground()[2],
                 ),
                 custom_glyphs: &[],
             }],
@@ -996,7 +1053,7 @@ impl App {
             });
 
         {
-            let bg = linear(term::DEFAULT_BG, 1.0);
+            let bg = linear(self.term.background(), 1.0);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("terminal"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1049,7 +1106,8 @@ impl ApplicationHandler<UserEvent> for App {
 
         let gpu = Gpu::new(&window);
         let scale = window.scale_factor() as f32;
-        let text = Text::new(&gpu, scale);
+        let config = self.config.clone();
+        let text = Text::new(&gpu, scale, &config);
         let quads = QuadRenderer::new(&gpu.device, gpu.config.format);
 
         self.width = gpu.config.width;

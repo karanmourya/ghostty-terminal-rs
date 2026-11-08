@@ -36,7 +36,8 @@ cargo run --release       # optimised
 | Drag / double-click selection, copy-on-select, Ctrl+Shift+C | ✅ |
 | Scrollback (10 000 lines) + mouse wheel, Shift+PgUp/PgDn/Home/End | ✅ (overlay scrollbar) |
 | DPI scaling | ✅ |
-| Unit tests for the VT state machine | ✅ (`cargo test`) |
+| Config file, themes, font size/family, padding, cursor style | ✅ |
+| Unit tests for the VT state machine and config parser | ✅ (`cargo test`) |
 
 ## Scrolling
 
@@ -79,7 +80,6 @@ mouse reporting, hold **Shift** to select instead of forwarding the drag.
 - OSC 8 hyperlinks, OSC 7 cwd.
 - Synchronized output (`?2026`).
 - Search, scrollback export.
-- Config file / themes / font selection (font is the system monospace at 15px).
 - Reflow on resize (content is preserved top-left, not rewrapped).
 - Scroll regions (`DECSTBM`), tab stops beyond every 8 columns.
 - Server/daemon mode, shell integration, notifications, kitty graphics protocol.
@@ -96,6 +96,7 @@ though the code is a clean-room Rust implementation rather than a translation.
 | Metal / OpenGL renderer | `wgpu` + instanced quad pipeline | `src/quad.rs`, `src/quad.wgsl` |
 | CoreText | `glyphon` (cosmic-text / swash) | `src/main.rs` |
 | macOS PTY / Linux pty | `portable-pty` (ConPTY) | `src/main.rs` |
+| `~/.config/ghostty/config` | flat `key = value` config file | `src/config.rs` |
 
 Rendering happens on a single GPU pass:
 
@@ -110,9 +111,30 @@ terminal grid owns line breaking.
 
 ## Configuration
 
+The config file uses Ghostty's flat `key = value` format. It is loaded from
+`%APPDATA%\ghostty-windows\config.toml`, or from `GHOSTTY_WIN_CONFIG` when
+that variable is set:
+
+```toml
+theme = catppuccin-mocha   # default | light | catppuccin-mocha
+font-size = 15
+font-family = "Cascadia Mono"
+padding = 6
+cursor-style = block       # block | bar | underline
+scrollback-limit = 10000
+
+background = "#1e1e2e"    # explicit colours override themes
+foreground = "#cdd6f4"
+palette = 3=#f9e2af        # remap one ANSI colour
+```
+
+See [`examples/config.toml`](examples/config.toml) for the full list. Unknown
+keys or bad values print a warning to stderr but never prevent startup.
+
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `GHOSTTY_WIN_SHELL` | `powershell.exe` | Shell command, arguments allowed: `pwsh.exe -NoLogo`, `wsl.exe`, `cmd.exe` |
+| `GHOSTTY_WIN_CONFIG` | `%APPDATA%\ghostty-windows\config.toml` | Config file path |
 
 ```powershell
 $env:GHOSTTY_WIN_SHELL = "pwsh.exe -NoLogo"
@@ -144,11 +166,12 @@ cargo run --release
 
 1. ~~Scrollback + scroll wheel~~ — done.
 2. ~~Mouse reporting~~ — done.
-3. **Clipboard polish** — OSC 52, drag auto-scroll past the window edges.
-4. **Config** — TOML file for font family/size, theme colors, padding, cursor style.
-5. **Resize reflow** — rewrap logical lines instead of cropping.
-6. **Tabs/splits** — requires a window manager layer above `winit` windows.
-7. **Performance pass** — dirty-row tracking, glyph cache reuse, frame pacing.
+3. ~~Selection + clipboard~~ — done.
+4. ~~Config~~ — done.
+5. **Clipboard polish** — OSC 52, drag auto-scroll past the window edges.
+6. **Resize reflow** — rewrap logical lines instead of cropping.
+7. **Tabs/splits** — requires a window manager layer above `winit` windows.
+8. **Performance pass** — dirty-row tracking, glyph cache reuse, frame pacing.
 
 ## Legal
 

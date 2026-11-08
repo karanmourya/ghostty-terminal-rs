@@ -1,4 +1,4 @@
-//! `term` â€” the terminal state machine.
+//! `term` — the terminal state machine.
 //!
 //! This is the Rust equivalent of Ghostty's Zig `src/terminal` + `src/vt`:
 //! it owns the screen grid and implements `vte::Perform` so the `vte` crate
@@ -103,6 +103,13 @@ pub struct Term {
     cy: usize,
     fg: [u8; 3],
     bg: [u8; 3],
+    /// Colours used for SGR 39/49 and for new blank cells.
+    default_fg: [u8; 3],
+    default_bg: [u8; 3],
+    /// 16-colour ANSI palette (configurable).
+    palette: [[u8; 3]; 16],
+    /// How many scrolled-off lines to keep.
+    scrollback_limit: usize,
     bold: bool,
     underline: bool,
     inverse: bool,
@@ -134,12 +141,16 @@ impl Term {
         Self {
             cols,
             rows,
-            cells: vec![Cell::default(); cols * rows],
+            cells: vec![Cell::blank(DEFAULT_FG, DEFAULT_BG); cols * rows],
             scrollback: VecDeque::new(),
             cx: 0,
             cy: 0,
             fg: DEFAULT_FG,
             bg: DEFAULT_BG,
+            default_fg: DEFAULT_FG,
+            default_bg: DEFAULT_BG,
+            palette: PALETTE,
+            scrollback_limit: SCROLLBACK_LIMIT,
             bold: false,
             underline: false,
             inverse: false,
@@ -157,6 +168,59 @@ impl Term {
             title: None,
             responses: Vec::new(),
             dirty: true,
+        }
+    }
+
+    /// A cell with the current default colours.
+    fn blank(&self) -> Cell {
+        Cell::blank(self.default_fg, self.default_bg)
+    }
+
+    /// Cell used by the renderer for lines that do not exist yet.
+    pub fn blank_cell(&self) -> Cell {
+        self.blank()
+    }
+
+    pub fn foreground(&self) -> [u8; 3] {
+        self.default_fg
+    }
+
+    pub fn background(&self) -> [u8; 3] {
+        self.default_bg
+    }
+
+    /// Apply a theme and repaint whatever was using the old defaults.
+    pub fn set_theme(&mut self, fg: [u8; 3], bg: [u8; 3], palette: [[u8; 3]; 16]) {
+        let (old_fg, old_bg) = (self.default_fg, self.default_bg);
+        for cell in self
+            .cells
+            .iter_mut()
+            .chain(self.scrollback.iter_mut().flatten())
+        {
+            if cell.fg == old_fg {
+                cell.fg = fg;
+            }
+            if cell.bg == old_bg {
+                cell.bg = bg;
+            }
+        }
+        self.default_fg = fg;
+        self.default_bg = bg;
+        self.palette = palette;
+        if self.fg == old_fg {
+            self.fg = fg;
+        }
+        if self.bg == old_bg {
+            self.bg = bg;
+        }
+        self.dirty = true;
+    }
+
+    /// Cap the history buffer, dropping the oldest lines immediately.
+    pub fn set_scrollback_limit(&mut self, limit: usize) {
+        self.scrollback_limit = limit.max(1);
+        while self.scrollback.len() > self.scrollback_limit {
+            self.scrollback.pop_front();
         }
     }
 
@@ -232,7 +296,8 @@ impl Term {
         }
         let old_cols = self.cols;
         let old_rows = self.rows;
-        let mut next = vec![Cell::default(); cols * rows];
+        let blank = self.blank();
+        let mut next = vec![blank; cols * rows];
         // Preserve top-left content; proper reflow is future work.
         for y in 0..rows.min(old_rows) {
             for x in 0..cols.min(old_cols) {
@@ -243,7 +308,7 @@ impl Term {
         // line matches `cols` after a resize.
         if cols != old_cols {
             for line in self.scrollback.iter_mut() {
-                line.resize(cols, Cell::default());
+                line.resize(cols, blank);
             }
         }
         self.cells = next;
@@ -272,13 +337,14 @@ impl Term {
             }
         }
         self.cells.copy_within(n * self.cols.., 0);
+        let blank = self.blank();
         for c in self.cells[(self.rows - n) * self.cols..].iter_mut() {
-            *c = Cell::default();
+            *c = blank;
         }
     }
 
     fn push_history_row(&mut self, row: usize) {
-        if self.scrollback.len() >= SCROLLBACK_LIMIT {
+        if self.scrollback.len() >= self.scrollback_limit {
             self.scrollback.pop_front();
         }
         let start = row * self.cols;
@@ -293,8 +359,9 @@ impl Term {
         }
         self.cells
             .copy_within(..(self.rows - n) * self.cols, n * self.cols);
+        let blank = self.blank();
         for c in self.cells[..n * self.cols].iter_mut() {
-            *c = Cell::default();
+            *c = blank;
         }
     }
 
@@ -373,16 +440,16 @@ impl Term {
                 22 => self.bold = false,
                 24 => self.underline = false,
                 27 => self.inverse = false,
-                30..=37 => self.fg = PALETTE[(p[i] - 30) as usize],
-                40..=47 => self.bg = PALETTE[(p[i] - 40) as usize],
-                39 => self.fg = DEFAULT_FG,
-                49 => self.bg = DEFAULT_BG,
-                90..=97 => self.fg = PALETTE[(p[i] - 90 + 8) as usize],
-                100..=107 => self.bg = PALETTE[(p[i] - 100 + 8) as usize],
+                30..=37 => self.fg = self.palette[(p[i] - 30) as usize],
+                40..=47 => self.bg = self.palette[(p[i] - 40) as usize],
+                39 => self.fg = self.default_fg,
+                49 => self.bg = self.default_bg,
+                90..=97 => self.fg = self.palette[(p[i] - 90 + 8) as usize],
+                100..=107 => self.bg = self.palette[(p[i] - 100 + 8) as usize],
                 38 | 48 => {
                     let is_fg = p[i] == 38;
                     if p.get(i + 1) == Some(&5) && i + 2 < p.len() {
-                        let color = xterm_256(p[i + 2]);
+                        let color = xterm_256(p[i + 2], &self.palette);
                         if is_fg {
                             self.fg = color
                         } else {
@@ -406,8 +473,8 @@ impl Term {
     }
 
     fn reset_pen(&mut self) {
-        self.fg = DEFAULT_FG;
-        self.bg = DEFAULT_BG;
+        self.fg = self.default_fg;
+        self.bg = self.default_bg;
         self.bold = false;
         self.underline = false;
         self.inverse = false;
@@ -433,7 +500,8 @@ impl Term {
                         });
                     }
                     if mode == 1049 || mode == 1047 {
-                        self.cells.iter_mut().for_each(|c| *c = Cell::default());
+                        let blank = self.blank();
+                        self.cells.iter_mut().for_each(|c| *c = blank);
                         self.cx = 0;
                         self.cy = 0;
                     }
@@ -449,10 +517,10 @@ impl Term {
     }
 }
 
-fn xterm_256(n: u16) -> [u8; 3] {
+fn xterm_256(n: u16, palette: &[[u8; 3]; 16]) -> [u8; 3] {
     let n = n as usize;
     if n < 16 {
-        return PALETTE[n];
+        return palette[n];
     }
     if n < 232 {
         let n = n - 16;
@@ -552,7 +620,10 @@ impl Perform for Term {
                     }
                     self.clear_row(self.cy, 0, self.cx + 1);
                 }
-                _ => self.cells.iter_mut().for_each(|c| *c = Cell::default()),
+                _ => {
+                    let blank = self.blank();
+                    self.cells.iter_mut().for_each(|c| *c = blank);
+                }
             },
             'K' => match p.first().copied().unwrap_or(0) {
                 0 => self.clear_row(self.cy, self.cx, self.cols),
@@ -621,7 +692,8 @@ impl Perform for Term {
         match byte {
             b'c' => {
                 // RIS - full reset
-                self.cells.iter_mut().for_each(|c| *c = Cell::default());
+                let blank = self.blank();
+                self.cells.iter_mut().for_each(|c| *c = blank);
                 self.cx = 0;
                 self.cy = 0;
                 self.saved = None;
@@ -836,6 +908,46 @@ mod tests {
         let mut t = Term::new(10, 2);
         feed(&mut t, "abcdef\x1b[3D\x1b[K");
         assert_eq!(row_text(&t, 0), "abc");
+    }
+
+    #[test]
+    fn theme_repaints_default_cells_only() {
+        let mut t = Term::new(8, 2);
+        feed(&mut t, "ab\x1b[41m \x1b[0m");
+        let new_fg = [0x01, 0x02, 0x03];
+        let new_bg = [0x04, 0x05, 0x06];
+        let mut palette = PALETTE;
+        palette[1] = [0xaa, 0xbb, 0xcc];
+        t.set_theme(new_fg, new_bg, palette);
+        assert_eq!(t.foreground(), new_fg);
+        assert_eq!(t.background(), new_bg);
+        // Default text picks up the new foreground...
+        assert_eq!(t.cell(0, 0).fg, new_fg);
+        // ...new output uses it...
+        feed(&mut t, "c");
+        assert_eq!(t.cell(3, 0).fg, new_fg);
+        // ...but explicitly colored cells keep their color...
+        assert_eq!(t.cell(2, 0).bg, PALETTE[1]);
+        // ...and SGR 31 now resolves through the themed palette.
+        feed(&mut t, "\x1b[31mZ");
+        assert_eq!(t.cell(4, 0).fg, [0xaa, 0xbb, 0xcc]);
+        // Blank cells created after the theme switch use the new background.
+        feed(&mut t, "\x1b[2J");
+        assert_eq!(t.cell(0, 0).bg, new_bg);
+    }
+
+    #[test]
+    fn scrollback_limit_is_configurable() {
+        let mut t = Term::new(6, 2);
+        t.set_scrollback_limit(2);
+        feed(&mut t, "one\r\ntwo\r\nthree\r\nfour");
+        assert_eq!(t.scrollback_len(), 2);
+        assert_eq!(line_text(&t, 0), "one");
+        assert_eq!(line_text(&t, 1), "two");
+        // Shrinking the limit trims existing history.
+        t.set_scrollback_limit(1);
+        assert_eq!(t.scrollback_len(), 1);
+        assert_eq!(line_text(&t, 0), "two");
     }
 
     #[test]

@@ -1,0 +1,18 @@
+# ghostty-windows configuration
+# Copy to %APPDATA%\ghostty-windows\config.toml or point
+# GHOSTTY_WIN_CONFIG at it. Unknown keys warn but never block startup.
+
+# Built-in themes: default (dark), light, catppuccin-mocha.
+# Explicit background/foreground/palette lines override a theme.
+theme = catppuccin-mocha
+
+# background = "#1e1e2e"
+# foreground = "#cdd6f4"
+# palette = 3=#f9e2af
+
+font-size = 15
+# font-family = "Cascadia Mono"
+
+padding = 6
+cursor-style = block  # block | bar | underline
+scrollback-limit = 10000
