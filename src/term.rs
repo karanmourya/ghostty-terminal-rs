@@ -1,4 +1,4 @@
-//! `term` — the terminal state machine.
+//! `term` â€” the terminal state machine.
 //!
 //! This is the Rust equivalent of Ghostty's Zig `src/terminal` + `src/vt`:
 //! it owns the screen grid and implements `vte::Perform` so the `vte` crate
@@ -72,6 +72,20 @@ impl Cell {
     }
 }
 
+/// Which mouse events the application asked to receive (DECSET 1000/1002/1003).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MouseMode {
+    /// No mouse reporting; the terminal uses the mouse for itself.
+    #[default]
+    Off,
+    /// Button presses and releases only (`?1000`, also X10 `?9`).
+    Click,
+    /// Presses, releases, and motion while a button is held (`?1002`).
+    Drag,
+    /// All motion, button or not (`?1003`).
+    Move,
+}
+
 #[derive(Clone)]
 struct SavedScreen {
     cells: Vec<Cell>,
@@ -100,6 +114,14 @@ pub struct Term {
     pub cursor_visible: bool,
     pub app_cursor_keys: bool,
     pub bracketed_paste: bool,
+    /// Mouse tracking modes; the highest enabled one wins.
+    click_mouse: bool,
+    drag_mouse: bool,
+    move_mouse: bool,
+    /// SGR mouse encoding (`?1006`) instead of the legacy X10 bytes.
+    pub mouse_sgr: bool,
+    /// Focus in/out reporting (`?1004`).
+    pub focus_reporting: bool,
     pub title: Option<String>,
     responses: Vec<Vec<u8>>,
     dirty: bool,
@@ -127,6 +149,11 @@ impl Term {
             cursor_visible: true,
             app_cursor_keys: false,
             bracketed_paste: false,
+            click_mouse: false,
+            drag_mouse: false,
+            move_mouse: false,
+            mouse_sgr: false,
+            focus_reporting: false,
             title: None,
             responses: Vec::new(),
             dirty: true,
@@ -157,6 +184,19 @@ impl Term {
 
     pub fn cursor(&self) -> (usize, usize) {
         (self.cx, self.cy)
+    }
+
+    /// Effective mouse tracking mode: the most permissive enabled one wins.
+    pub fn mouse_mode(&self) -> MouseMode {
+        if self.move_mouse {
+            MouseMode::Move
+        } else if self.drag_mouse {
+            MouseMode::Drag
+        } else if self.click_mouse {
+            MouseMode::Click
+        } else {
+            MouseMode::Off
+        }
     }
 
     /// Number of lines currently held in history.
@@ -376,6 +416,11 @@ impl Term {
     fn set_private_mode(&mut self, mode: u16, enabled: bool) {
         match mode {
             1 => self.app_cursor_keys = enabled,
+            9 | 1000 => self.click_mouse = enabled,
+            1002 => self.drag_mouse = enabled,
+            1003 => self.move_mouse = enabled,
+            1004 => self.focus_reporting = enabled,
+            1006 => self.mouse_sgr = enabled,
             25 => self.cursor_visible = enabled,
             2004 => self.bracketed_paste = enabled,
             47 | 1047 | 1049 => {
@@ -585,6 +630,11 @@ impl Perform for Term {
                 self.cursor_visible = true;
                 self.app_cursor_keys = false;
                 self.bracketed_paste = false;
+                self.click_mouse = false;
+                self.drag_mouse = false;
+                self.move_mouse = false;
+                self.mouse_sgr = false;
+                self.focus_reporting = false;
                 self.reset_pen();
             }
             b'D' => self.linefeed(),
@@ -725,6 +775,45 @@ mod tests {
         assert!(t.bracketed_paste);
         feed(&mut t, "\x1b[?2004l");
         assert!(!t.bracketed_paste);
+    }
+
+    #[test]
+    fn mouse_reporting_modes() {
+        let mut t = Term::new(10, 3);
+        assert_eq!(t.mouse_mode(), MouseMode::Off);
+        assert!(!t.mouse_sgr);
+
+        feed(&mut t, "\x1b[?1000h\x1b[?1006h");
+        assert_eq!(t.mouse_mode(), MouseMode::Click);
+        assert!(t.mouse_sgr);
+
+        feed(&mut t, "\x1b[?1002h");
+        assert_eq!(t.mouse_mode(), MouseMode::Drag);
+
+        feed(&mut t, "\x1b[?1003h");
+        assert_eq!(t.mouse_mode(), MouseMode::Move);
+
+        // Disabling the most permissive mode falls back to the next one.
+        feed(&mut t, "\x1b[?1003l");
+        assert_eq!(t.mouse_mode(), MouseMode::Drag);
+
+        // Turning off a different mode must not disturb the active one.
+        feed(&mut t, "\x1b[?1000l");
+        assert_eq!(t.mouse_mode(), MouseMode::Drag);
+
+        feed(&mut t, "\x1b[?1002l");
+        assert_eq!(t.mouse_mode(), MouseMode::Off);
+    }
+
+    #[test]
+    fn focus_reporting_and_reset() {
+        let mut t = Term::new(10, 3);
+        feed(&mut t, "\x1b[?1004h");
+        assert!(t.focus_reporting);
+        feed(&mut t, "\x1bc");
+        assert!(!t.focus_reporting);
+        assert!(!t.mouse_sgr);
+        assert_eq!(t.mouse_mode(), MouseMode::Off);
     }
 
     #[test]

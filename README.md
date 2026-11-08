@@ -31,6 +31,8 @@ cargo run --release       # optimised
 | Keyboard incl. F1–F12, arrows, Home/End/PgUp/PgDn | ✅ |
 | Ctrl+V / Ctrl+Shift+V paste | ✅ |
 | Bracketed paste (`?2004`) | ✅ |
+| Mouse reporting: `?1000`/`?1002`/`?1003`, SGR `?1006` and legacy X10 | ✅ |
+| Focus reporting (`?1004`) | ✅ |
 | Scrollback (10 000 lines) + mouse wheel, Shift+PgUp/PgDn/Home/End | ✅ (overlay scrollbar) |
 | DPI scaling | ✅ |
 | Unit tests for the VT state machine | ✅ (`cargo test`) |
@@ -50,12 +52,24 @@ The primary screen keeps up to 10 000 scrolled-off lines. The alternate screen
 While scrolled back, a thin overlay scrollbar appears on the right and the
 viewport stays anchored if new output arrives.
 
+## Mouse
+
+Applications that enable xterm mouse tracking receive clicks, drags, wheel
+events, and modifier bits (Ctrl/Alt) as standard reports. Shift is reserved for
+the terminal: **Shift+click/drag/wheel** always means "scroll or select locally"
+rather than "send this to the app".
+
+Both encodings are supported: SGR (`?1006`, the default for vim, tmux, less,
+htop) and legacy X10 bytes for older programs. All three tracking modes are
+implemented: `?1000` (clicks), `?1002` (drag), `?1003` (any motion).
+
 ## What is missing (the honest list)
 
 - Tabs, splits, multiple windows.
-- Mouse reporting (clicks are not forwarded to applications).
-- OSC 8 hyperlinks, OSC 52 clipboard, OSC 7 cwd.
-- Focus reporting, synchronized output.
+- Text selection and copy (Ctrl+Shift+C), OSC 52 clipboard.
+- OSC 8 hyperlinks, OSC 7 cwd.
+- Synchronized output (`?2026`).
+- Search, scrollback export.
 - Config file / themes / font selection (font is the system monospace at 15px).
 - Reflow on resize (content is preserved top-left, not rewrapped).
 - Scroll regions (`DECSTBM`), tab stops beyond every 8 columns.
@@ -110,14 +124,22 @@ $env:GHOSTTY_WIN_SHELL = "powershell.exe -NoLogo -NoExit -File C:\Ghostty-window
 cargo run
 ```
 
+Mouse reporting (needs WSL; each click prints `^[[<button;col;rowM`):
+
+```powershell
+$env:GHOSTTY_WIN_SHELL = "wsl.exe -e bash /mnt/c/Ghostty-windows/examples/mouse-test.sh"
+cargo run --release
+```
+
 ## Roadmap to something you could daily-drive
 
 1. ~~Scrollback + scroll wheel~~ — done.
-2. **Mouse reporting** — SGR 1006 and friends.
-3. **Config** — TOML file for font family/size, theme colors, padding, cursor style.
-4. **Resize reflow** — rewrap logical lines instead of cropping.
-5. **Tabs/splits** — requires a window manager layer above `winit` windows.
-6. **Performance pass** — dirty-row tracking, glyph cache reuse, frame pacing.
+2. ~~Mouse reporting~~ — done.
+3. **Selection + clipboard** — drag to select, Ctrl+Shift+C, and OSC 52.
+4. **Config** — TOML file for font family/size, theme colors, padding, cursor style.
+5. **Resize reflow** — rewrap logical lines instead of cropping.
+6. **Tabs/splits** — requires a window manager layer above `winit` windows.
+7. **Performance pass** — dirty-row tracking, glyph cache reuse, frame pacing.
 
 ## Legal
 

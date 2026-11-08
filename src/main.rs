@@ -30,7 +30,7 @@ use term::Term;
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
-    event::{ElementState, Ime, WindowEvent},
+    event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{Key, ModifiersState, NamedKey},
     window::{Window, WindowId},
@@ -298,6 +298,11 @@ struct App {
     /// Lines scrolled up from the live screen (0 = bottom).
     scroll: usize,
 
+    /// Last known pointer position, in grid cells.
+    pointer_cell: (usize, usize),
+    /// Button currently held (xterm button code) while reporting motion.
+    mouse_down: Option<u8>,
+
     modifiers: ModifiersState,
     width: u32,
     height: u32,
@@ -318,6 +323,8 @@ impl App {
             pty_master: None,
             rx: None,
             scroll: 0,
+            pointer_cell: (0, 0),
+            mouse_down: None,
             modifiers: ModifiersState::empty(),
             width: 1000,
             height: 640,
@@ -383,6 +390,59 @@ impl App {
 
     fn jump_to_bottom(&mut self) {
         self.set_scroll(0);
+    }
+
+    // -- mouse reporting ---------------------------------------------------
+
+    fn cell_at(&self, x: f64, y: f64) -> (usize, usize) {
+        let Some(text) = self.text.as_ref() else {
+            return (0, 0);
+        };
+        let col = ((x as f32 - PADDING) / text.cell_width).floor().max(0.0) as usize;
+        let row = ((y as f32 - PADDING) / text.line_height).floor().max(0.0) as usize;
+        (
+            col.min(self.term.cols.saturating_sub(1)),
+            row.min(self.term.rows.saturating_sub(1)),
+        )
+    }
+
+    /// Encode an xterm mouse report, or `None` when the application did not
+    /// ask for mouse events. Shift is reserved for local selection/scrollback.
+    fn mouse_report(&self, button: u8, release: bool) -> Option<Vec<u8>> {
+        if self.term.mouse_mode() == term::MouseMode::Off || self.modifiers.shift_key() {
+            return None;
+        }
+        let (col, row) = self.pointer_cell;
+        Some(encode_mouse_report(
+            button,
+            release,
+            self.term.mouse_sgr,
+            col,
+            row,
+            self.modifiers.alt_key(),
+            self.modifiers.control_key(),
+        ))
+    }
+
+    fn report_mouse(&mut self, button: u8, release: bool) {
+        if let Some(bytes) = self.mouse_report(button, release) {
+            self.write_pty(&bytes);
+        }
+    }
+
+    /// Motion report: `?1002` only streams while a button is held, `?1003`
+    /// streams all motion. The xterm motion bit is 32.
+    fn report_motion(&mut self) {
+        if self.scroll > 0 {
+            return;
+        }
+        match self.term.mouse_mode() {
+            term::MouseMode::Move => {}
+            term::MouseMode::Drag if self.mouse_down.is_some() => {}
+            _ => return,
+        }
+        let code = self.mouse_down.unwrap_or(3) + 32;
+        self.report_mouse(code, false);
     }
 
     // -- PTY ---------------------------------------------------------------
@@ -876,7 +936,10 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
             }
-            WindowEvent::Focused(_) => {
+            WindowEvent::Focused(focused) => {
+                if self.term.focus_reporting {
+                    self.write_pty(if focused { b"\x1b[I" } else { b"\x1b[O" });
+                }
                 if let Some(window) = self.window.as_ref() {
                     window.request_redraw();
                 }
@@ -930,7 +993,42 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                use winit::event::MouseScrollDelta;
+                // Wheel events belong to the application when it enabled mouse
+                // reporting; Shift keeps the local scrollback override.
+                let wheel = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => {
+                        if y > 0.0 {
+                            Some(64u8)
+                        } else if y < 0.0 {
+                            Some(65)
+                        } else if x > 0.0 {
+                            Some(66)
+                        } else if x < 0.0 {
+                            Some(67)
+                        } else {
+                            None
+                        }
+                    }
+                    MouseScrollDelta::PixelDelta(pos) => {
+                        if pos.y > 0.0 {
+                            Some(64u8)
+                        } else if pos.y < 0.0 {
+                            Some(65)
+                        } else if pos.x > 0.0 {
+                            Some(66)
+                        } else if pos.x < 0.0 {
+                            Some(67)
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(button) = wheel {
+                    if let Some(bytes) = self.mouse_report(button, false) {
+                        self.write_pty(&bytes);
+                        return;
+                    }
+                }
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => (y * 3.0).round() as i32,
                     MouseScrollDelta::PixelDelta(pos) => {
@@ -947,6 +1045,31 @@ impl ApplicationHandler<UserEvent> for App {
                     self.scroll_by(lines);
                 }
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                let cell = self.cell_at(position.x, position.y);
+                if cell == self.pointer_cell {
+                    return;
+                }
+                self.pointer_cell = cell;
+                self.report_motion();
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let Some(code) = mouse_button_code(button) else {
+                    return;
+                };
+                match state {
+                    ElementState::Pressed => {
+                        self.mouse_down = Some(code);
+                        // A click while scrolled back means "go back to live".
+                        self.jump_to_bottom();
+                        self.report_mouse(code, false);
+                    }
+                    ElementState::Released => {
+                        self.mouse_down = None;
+                        self.report_mouse(code, true);
+                    }
+                }
+            }
             WindowEvent::Ime(Ime::Commit(text)) => {
                 self.jump_to_bottom();
                 self.write_pty(text.as_bytes());
@@ -959,6 +1082,45 @@ impl ApplicationHandler<UserEvent> for App {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         // Belt-and-braces: also drain here in case a wake event coalesced.
         self.drain_pty();
+    }
+}
+
+/// Encode one xterm mouse report. `alt`/`ctrl` add the xterm modifier bits
+/// (shift is the caller's local override and never reaches the application).
+fn encode_mouse_report(
+    button: u8,
+    release: bool,
+    sgr: bool,
+    col: usize,
+    row: usize,
+    alt: bool,
+    ctrl: bool,
+) -> Vec<u8> {
+    let mut code = button + u8::from(alt) * 8 + u8::from(ctrl) * 16;
+    let (x, y) = (col + 1, row + 1);
+    if sgr {
+        let end = if release { 'm' } else { 'M' };
+        format!("\x1b[<{code};{x};{y}{end}").into_bytes()
+    } else {
+        // Legacy X10 encoding cannot name the released button.
+        if release {
+            code = 3;
+        }
+        let x = (32 + x).min(255) as u8;
+        let y = (32 + y).min(255) as u8;
+        vec![0x1b, b'[', b'M', 32 + code, x, y]
+    }
+}
+
+fn mouse_button_code(button: MouseButton) -> Option<u8> {
+    // xterm button codes: left/middle/right = 0/1/2, extra buttons 8/9.
+    match button {
+        MouseButton::Left => Some(0),
+        MouseButton::Middle => Some(1),
+        MouseButton::Right => Some(2),
+        MouseButton::Back => Some(8),
+        MouseButton::Forward => Some(9),
+        MouseButton::Other(_) => None,
     }
 }
 
@@ -977,5 +1139,61 @@ fn main() {
 
     if let Err(err) = event_loop.run_app(&mut app) {
         eprintln!("event loop failed: {err}");
+    }
+}
+
+#[cfg(test)]
+mod mouse_tests {
+    use super::*;
+
+    #[test]
+    fn sgr_press_and_release() {
+        assert_eq!(
+            encode_mouse_report(0, false, true, 0, 0, false, false),
+            b"\x1b[<0;1;1M"
+        );
+        assert_eq!(
+            encode_mouse_report(2, true, true, 4, 2, false, false),
+            b"\x1b[<2;5;3m"
+        );
+    }
+
+    #[test]
+    fn sgr_modifiers() {
+        // Ctrl+wheel up (64) at the top-left corner.
+        assert_eq!(
+            encode_mouse_report(64, false, true, 0, 0, false, true),
+            b"\x1b[<80;1;1M"
+        );
+        // Alt+left press.
+        assert_eq!(
+            encode_mouse_report(0, false, true, 10, 4, true, false),
+            b"\x1b[<8;11;5M"
+        );
+    }
+
+    #[test]
+    fn legacy_x10_encoding() {
+        assert_eq!(
+            encode_mouse_report(0, false, false, 0, 0, false, false),
+            [0x1b, b'[', b'M', 32, 33, 33]
+        );
+        // Release loses the button number in X10 mode.
+        assert_eq!(
+            encode_mouse_report(2, true, false, 1, 1, false, false),
+            [0x1b, b'[', b'M', 35, 34, 34]
+        );
+        // Motion: button 3 (none) plus the motion bit.
+        assert_eq!(
+            encode_mouse_report(35, false, false, 0, 0, false, false),
+            [0x1b, b'[', b'M', 67, 33, 33]
+        );
+    }
+
+    #[test]
+    fn coordinates_clamp_to_the_legacy_byte_range() {
+        let bytes = encode_mouse_report(0, false, false, 300, 300, false, false);
+        assert_eq!(bytes[4], 255);
+        assert_eq!(bytes[5], 255);
     }
 }
