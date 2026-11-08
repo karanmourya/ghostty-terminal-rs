@@ -33,6 +33,7 @@ cargo run --release       # optimised
 | Bracketed paste (`?2004`) | ✅ |
 | Mouse reporting: `?1000`/`?1002`/`?1003`, SGR `?1006` and legacy X10 | ✅ |
 | Focus reporting (`?1004`) | ✅ |
+| Drag / double-click selection, copy-on-select, Ctrl+Shift+C | ✅ |
 | Scrollback (10 000 lines) + mouse wheel, Shift+PgUp/PgDn/Home/End | ✅ (overlay scrollbar) |
 | DPI scaling | ✅ |
 | Unit tests for the VT state machine | ✅ (`cargo test`) |
@@ -63,10 +64,18 @@ Both encodings are supported: SGR (`?1006`, the default for vim, tmux, less,
 htop) and legacy X10 bytes for older programs. All three tracking modes are
 implemented: `?1000` (clicks), `?1002` (drag), `?1003` (any motion).
 
+## Selection
+
+Drag with the left button to select, double-click for a word. The selection is
+highlighted behind the text, stays attached to its lines while you scroll, and
+is copied to the clipboard when you release the mouse. Ctrl+Shift+C copies it
+again; typing or clicking elsewhere clears it. When an application has enabled
+mouse reporting, hold **Shift** to select instead of forwarding the drag.
+
 ## What is missing (the honest list)
 
 - Tabs, splits, multiple windows.
-- Text selection and copy (Ctrl+Shift+C), OSC 52 clipboard.
+- OSC 52 clipboard, selection auto-scroll past the window edges.
 - OSC 8 hyperlinks, OSC 7 cwd.
 - Synchronized output (`?2026`).
 - Search, scrollback export.
@@ -135,7 +144,7 @@ cargo run --release
 
 1. ~~Scrollback + scroll wheel~~ — done.
 2. ~~Mouse reporting~~ — done.
-3. **Selection + clipboard** — drag to select, Ctrl+Shift+C, and OSC 52.
+3. **Clipboard polish** — OSC 52, drag auto-scroll past the window edges.
 4. **Config** — TOML file for font family/size, theme colors, padding, cursor style.
 5. **Resize reflow** — rewrap logical lines instead of cropping.
 6. **Tabs/splits** — requires a window manager layer above `winit` windows.

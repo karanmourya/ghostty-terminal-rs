@@ -26,6 +26,7 @@ use glyphon::{
 };
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use term::Term;
 use winit::{
     application::ApplicationHandler,
@@ -42,10 +43,35 @@ const DEFAULT_FONT_SIZE: f32 = 15.0;
 const LINE_HEIGHT_RATIO: f32 = 1.32;
 const PADDING: f32 = 6.0;
 const CURSOR_THICKNESS: f32 = 2.0;
+/// Highlight colour painted behind selected cells.
+const SELECTION_BG: [u8; 3] = [0x58, 0x5e, 0x7a];
 
 enum UserEvent {
     /// The PTY reader thread has output waiting (or has exited).
     Wake,
+}
+
+/// A text selection, stored in absolute line coordinates (scrollback included)
+/// so it stays attached to the text while the viewport moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Selection {
+    anchor: (usize, usize),
+    head: (usize, usize),
+}
+
+impl Selection {
+    fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
+
+    /// Top-left and bottom-right corners, in reading order.
+    fn bounds(&self) -> ((usize, usize), (usize, usize)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +328,11 @@ struct App {
     pointer_cell: (usize, usize),
     /// Button currently held (xterm button code) while reporting motion.
     mouse_down: Option<u8>,
+    /// Active text selection and whether the pointer is dragging it out.
+    selection: Option<Selection>,
+    selecting: bool,
+    /// Time and cell of the previous primary click, for double-click words.
+    last_click: Option<(std::time::Instant, (usize, usize))>,
 
     modifiers: ModifiersState,
     width: u32,
@@ -325,6 +356,9 @@ impl App {
             scroll: 0,
             pointer_cell: (0, 0),
             mouse_down: None,
+            selection: None,
+            selecting: false,
+            last_click: None,
             modifiers: ModifiersState::empty(),
             width: 1000,
             height: 640,
@@ -443,6 +477,104 @@ impl App {
         }
         let code = self.mouse_down.unwrap_or(3) + 32;
         self.report_mouse(code, false);
+    }
+
+    // -- selection ---------------------------------------------------------
+
+    /// Convert a viewport cell into absolute line coordinates.
+    fn absolute_cell(&self, cell: (usize, usize)) -> (usize, usize) {
+        let top = self.term.scrollback_len().saturating_sub(self.scroll);
+        (top + cell.1, cell.0)
+    }
+
+    fn set_selection(&mut self, selection: Option<Selection>) {
+        self.selection = selection;
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+
+    fn begin_selection(&mut self, cell: (usize, usize)) {
+        let at = self.absolute_cell(cell);
+        let now = Instant::now();
+        let double_click = self
+            .last_click
+            .map(|(when, previous)| {
+                previous == at && now.duration_since(when) < Duration::from_millis(400)
+            })
+            .unwrap_or(false);
+        self.last_click = Some((now, at));
+        self.selecting = true;
+        if double_click {
+            if let Some(word) = self.word_selection(at) {
+                self.set_selection(Some(word));
+                return;
+            }
+        }
+        self.set_selection(Some(Selection {
+            anchor: at,
+            head: at,
+        }));
+    }
+
+    /// Select the word (path-ish characters included) around `at`.
+    fn word_selection(&self, at: (usize, usize)) -> Option<Selection> {
+        let line = self.term.line(at.0)?;
+        if line.is_empty() {
+            return None;
+        }
+        let is_word = |c: char| {
+            c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '\\' | ':' | '~' | '@')
+        };
+        let mut idx = at.1.min(line.len() - 1);
+        while idx > 0 && !is_word(line[idx].ch) {
+            idx -= 1;
+        }
+        if !is_word(line[idx].ch) {
+            return None;
+        }
+        let mut start = idx;
+        while start > 0 && is_word(line[start - 1].ch) {
+            start -= 1;
+        }
+        let mut end = idx;
+        while end + 1 < line.len() && is_word(line[end + 1].ch) {
+            end += 1;
+        }
+        Some(Selection {
+            anchor: (at.0, start),
+            head: (at.0, end),
+        })
+    }
+
+    fn update_selection(&mut self, cell: (usize, usize)) {
+        if !self.selecting {
+            return;
+        }
+        let Some(sel) = self.selection else {
+            return;
+        };
+        let head = self.absolute_cell(cell);
+        if head != sel.head {
+            self.set_selection(Some(Selection {
+                anchor: sel.anchor,
+                head,
+            }));
+        }
+    }
+
+    /// Plain text of the current selection, newline-joined, trailing blanks cut.
+    fn selection_text(&self) -> Option<String> {
+        self.selection
+            .and_then(|sel| selection_text(&self.term, sel))
+    }
+
+    fn copy_selection(&mut self) {
+        if let Some(text) = self.selection_text() {
+            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                let _ = clipboard.set_text(text);
+            }
+        }
     }
 
     // -- PTY ---------------------------------------------------------------
@@ -712,6 +844,39 @@ impl App {
                 }
             }
         }
+        // --- selection highlight (painted over cell backgrounds, under text) ---
+        if let Some(sel) = self.selection.filter(|sel| !sel.is_empty()) {
+            let ((start_line, start_col), (end_line, end_col)) = sel.bounds();
+            let color = linear(SELECTION_BG, 0.85);
+            for y in 0..rows {
+                let line_index = top + y;
+                if line_index < start_line || line_index > end_line {
+                    continue;
+                }
+                let first = if line_index == start_line {
+                    start_col.min(cols - 1)
+                } else {
+                    0
+                };
+                let last = if line_index == end_line {
+                    end_col.min(cols - 1)
+                } else {
+                    cols - 1
+                };
+                if first > last {
+                    continue;
+                }
+                instances.push(Quad {
+                    rect: [
+                        PADDING + first as f32 * cell_w,
+                        PADDING + y as f32 * line_h,
+                        (last - first + 1) as f32 * cell_w,
+                        line_h,
+                    ],
+                    color,
+                });
+            }
+        }
         let bg_count = instances.len() as u32;
 
         // The scrollbar only appears when there is history and only while
@@ -975,6 +1140,16 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
+                // Ctrl+Shift+C copies the selection (plain Ctrl+C stays SIGINT).
+                if self.modifiers.control_key() && self.modifiers.shift_key() {
+                    if let Key::Character(text) = &event.logical_key {
+                        if text.eq_ignore_ascii_case("c") {
+                            self.copy_selection();
+                            return;
+                        }
+                    }
+                }
+
                 // Ctrl+V pastes; Ctrl+Shift+V is the same thing for muscle memory.
                 if self.modifiers.control_key() {
                     if let Key::Character(text) = &event.logical_key {
@@ -989,6 +1164,9 @@ impl ApplicationHandler<UserEvent> for App {
                     // Typing always returns to the live screen, but modifier-only
                     // presses must not disturb a scrolled-back viewport.
                     self.jump_to_bottom();
+                    if self.selection.is_some() {
+                        self.set_selection(None);
+                    }
                     self.write_pty(&bytes);
                 }
             }
@@ -1051,22 +1229,43 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 self.pointer_cell = cell;
-                self.report_motion();
+                if self.selecting {
+                    self.update_selection(cell);
+                } else {
+                    self.report_motion();
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let Some(code) = mouse_button_code(button) else {
                     return;
                 };
+                // The application gets the mouse unless Shift is held, which is
+                // the local override for selecting text.
+                let reports =
+                    self.term.mouse_mode() != term::MouseMode::Off && !self.modifiers.shift_key();
                 match state {
                     ElementState::Pressed => {
                         self.mouse_down = Some(code);
-                        // A click while scrolled back means "go back to live".
-                        self.jump_to_bottom();
-                        self.report_mouse(code, false);
+                        if reports {
+                            // A click while scrolled back means "back to live".
+                            self.jump_to_bottom();
+                            self.report_mouse(code, false);
+                        } else if code == 0 {
+                            self.begin_selection(self.pointer_cell);
+                        }
                     }
                     ElementState::Released => {
                         self.mouse_down = None;
-                        self.report_mouse(code, true);
+                        if reports {
+                            self.report_mouse(code, true);
+                        } else if self.selecting && code == 0 {
+                            self.selecting = false;
+                            if self.selection.is_none_or(|sel| sel.is_empty()) {
+                                self.set_selection(None);
+                            } else {
+                                self.copy_selection();
+                            }
+                        }
                     }
                 }
             }
@@ -1112,6 +1311,52 @@ fn encode_mouse_report(
     }
 }
 
+/// Plain text of `sel`, newline-joined, trailing blanks trimmed per line.
+fn selection_text(term: &Term, sel: Selection) -> Option<String> {
+    if sel.is_empty() {
+        return None;
+    }
+    let ((start_line, start_col), (end_line, end_col)) = sel.bounds();
+    let mut out = String::new();
+    for line_index in start_line..=end_line {
+        let Some(cells) = term.line(line_index) else {
+            continue;
+        };
+        if cells.is_empty() {
+            continue;
+        }
+        let first = if line_index == start_line {
+            start_col.min(cells.len() - 1)
+        } else {
+            0
+        };
+        let last = if line_index == end_line {
+            end_col.min(cells.len() - 1)
+        } else {
+            cells.len() - 1
+        };
+        if first > last {
+            continue;
+        }
+        let mut row = String::with_capacity(last - first + 1);
+        for cell in &cells[first..=last] {
+            // Skip the right half of wide glyphs.
+            if cell.ch != '\0' {
+                row.push(cell.ch);
+            }
+        }
+        out.push_str(row.trim_end());
+        if line_index != end_line {
+            out.push_str("\r\n");
+        }
+    }
+    if out.trim().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 fn mouse_button_code(button: MouseButton) -> Option<u8> {
     // xterm button codes: left/middle/right = 0/1/2, extra buttons 8/9.
     match button {
@@ -1139,6 +1384,83 @@ fn main() {
 
     if let Err(err) = event_loop.run_app(&mut app) {
         eprintln!("event loop failed: {err}");
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    fn term_with(text: &str) -> Term {
+        let mut term = Term::new(12, 4);
+        let mut parser = vte::Parser::new();
+        term.feed(&mut parser, text.as_bytes());
+        term
+    }
+
+    #[test]
+    fn single_line_is_trimmed() {
+        let term = term_with("hello world");
+        let sel = Selection {
+            anchor: (0, 6),
+            head: (0, 10),
+        };
+        assert_eq!(selection_text(&term, sel).as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn multi_line_join_uses_crlf() {
+        let term = term_with("one\r\ntwo\r\nthree");
+        let sel = Selection {
+            anchor: (0, 1),
+            head: (2, 1),
+        };
+        assert_eq!(
+            selection_text(&term, sel).as_deref(),
+            Some("ne\r\ntwo\r\nth")
+        );
+    }
+
+    #[test]
+    fn reversed_selection_is_normalised() {
+        let term = term_with("abcd");
+        let sel = Selection {
+            anchor: (0, 2),
+            head: (0, 1),
+        };
+        assert_eq!(selection_text(&term, sel).as_deref(), Some("bc"));
+    }
+
+    #[test]
+    fn empty_selection_is_none() {
+        let term = term_with("abcd");
+        let sel = Selection {
+            anchor: (0, 1),
+            head: (0, 1),
+        };
+        assert_eq!(selection_text(&term, sel), None);
+    }
+
+    #[test]
+    fn wide_glyphs_copy_once() {
+        let term = term_with("日本");
+        let sel = Selection {
+            anchor: (0, 0),
+            head: (0, 3),
+        };
+        assert_eq!(selection_text(&term, sel).as_deref(), Some("日本"));
+    }
+
+    #[test]
+    fn selection_reaches_into_scrollback() {
+        let mut term = Term::new(8, 2);
+        let mut parser = vte::Parser::new();
+        term.feed(&mut parser, b"one\r\ntwo\r\nthree");
+        let sel = Selection {
+            anchor: (0, 0),
+            head: (0, 2),
+        };
+        assert_eq!(selection_text(&term, sel).as_deref(), Some("one"));
     }
 }
 
