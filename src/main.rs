@@ -181,7 +181,7 @@ impl Text {
     }
 
     /// Rebuild the shaped text buffer from the terminal grid.
-    fn rebuild(&mut self, term: &Term, width: f32, height: f32) {
+    fn rebuild(&mut self, term: &Term, scroll: usize, width: f32, height: f32) {
         let mut buffer = Buffer::new(
             &mut self.font_system,
             Metrics::new(self.font_size, self.line_height),
@@ -198,11 +198,17 @@ impl Text {
         // Group horizontal runs of identical style into spans so colored output
         // shapes in one pass instead of one buffer per cell.
         let mut spans: Vec<(String, Attrs<'static>)> = Vec::new();
+        let top = term.scrollback_len().saturating_sub(scroll);
         for y in 0..term.rows {
             let mut text = String::with_capacity(term.cols);
             let mut current: Option<([u8; 3], bool, bool)> = None;
+            let line = term.line(top + y);
             for x in 0..term.cols {
-                let cell = term.cell(x, y);
+                // Missing lines (only possible mid-resize) render as blanks.
+                let cell = match line.and_then(|line| line.get(x)) {
+                    Some(cell) => *cell,
+                    None => term::Cell::default(),
+                };
                 if cell.ch == '\0' {
                     // Right half of a wide glyph: the glyph itself advances.
                     continue;
@@ -228,9 +234,7 @@ impl Text {
 
         buffer.set_rich_text(
             &mut self.font_system,
-            spans
-                .iter()
-                .map(|(text, attrs)| (text.as_str(), *attrs)),
+            spans.iter().map(|(text, attrs)| (text.as_str(), *attrs)),
             attrs(term::DEFAULT_FG, false, false),
             Shaping::Advanced,
         );
@@ -291,6 +295,9 @@ struct App {
     pty_master: Option<Box<dyn MasterPty + Send>>,
     rx: Option<Receiver<Vec<u8>>>,
 
+    /// Lines scrolled up from the live screen (0 = bottom).
+    scroll: usize,
+
     modifiers: ModifiersState,
     width: u32,
     height: u32,
@@ -310,6 +317,7 @@ impl App {
             pty_writer: None,
             pty_master: None,
             rx: None,
+            scroll: 0,
             modifiers: ModifiersState::empty(),
             width: 1000,
             height: 640,
@@ -348,6 +356,33 @@ impl App {
         if let Some(text) = self.text.as_mut() {
             text.buffer = None;
         }
+        self.scroll = self.scroll.min(self.term.scrollback_len());
+    }
+
+    // -- scrolling ---------------------------------------------------------
+
+    fn scroll_by(&mut self, lines: i32) {
+        let max = self.term.scrollback_len() as i32;
+        let next = (self.scroll as i32 + lines).clamp(0, max) as usize;
+        self.set_scroll(next);
+    }
+
+    fn set_scroll(&mut self, next: usize) {
+        let next = next.min(self.term.scrollback_len());
+        if next == self.scroll {
+            return;
+        }
+        self.scroll = next;
+        if let Some(text) = self.text.as_mut() {
+            text.buffer = None;
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+
+    fn jump_to_bottom(&mut self) {
+        self.set_scroll(0);
     }
 
     // -- PTY ---------------------------------------------------------------
@@ -436,10 +471,19 @@ impl App {
                 chunks.push(chunk);
             }
         }
+        let history_before = self.term.scrollback_len();
         let mut any = false;
         for chunk in chunks {
             self.term.feed(&mut self.parser, &chunk);
             any = true;
+        }
+        // Keep a scrolled-back viewport anchored to the same lines while new
+        // output pushes lines into history.
+        if self.scroll > 0 {
+            let added = self.term.scrollback_len().saturating_sub(history_before);
+            if added > 0 {
+                self.scroll = (self.scroll + added).min(self.term.scrollback_len());
+            }
         }
         let dirty = any && self.term.take_dirty();
         if dirty {
@@ -537,7 +581,13 @@ impl App {
         if let Ok(mut clipboard) = arboard::Clipboard::new() {
             if let Ok(text) = clipboard.get_text() {
                 let normalized = text.replace("\r\n", "\r");
-                self.write_pty(normalized.as_bytes());
+                if self.term.bracketed_paste {
+                    self.write_pty(b"\x1b[200~");
+                    self.write_pty(normalized.as_bytes());
+                    self.write_pty(b"\x1b[201~");
+                } else {
+                    self.write_pty(normalized.as_bytes());
+                }
             }
         }
     }
@@ -565,14 +615,18 @@ impl App {
         let line_h = text.line_height;
 
         if text.dirty || text.buffer.is_none() {
-            text.rebuild(&self.term, surface_width, surface_height);
+            text.rebuild(&self.term, self.scroll, surface_width, surface_height);
         }
 
         // --- background quads + cursor quads ---
+        let top = self.term.scrollback_len().saturating_sub(self.scroll);
         let mut instances: Vec<Quad> = Vec::new();
         for y in 0..rows {
+            let line = self.term.line(top + y);
             for x in 0..cols {
-                let cell = self.term.cell(x, y);
+                let Some(cell) = line.and_then(|line| line.get(x)) else {
+                    continue;
+                };
                 if cell.bg != term::DEFAULT_BG {
                     instances.push(Quad {
                         rect: [
@@ -600,7 +654,28 @@ impl App {
         }
         let bg_count = instances.len() as u32;
 
-        let cursor_visible = self.term.cursor_visible && window.has_focus();
+        // The scrollbar only appears when there is history and only while
+        // scrolled away from the live screen (like Ghostty's overlay).
+        let history = self.term.scrollback_len();
+        if history > 0 && self.scroll > 0 {
+            let track_x = surface_width - PADDING - 4.0;
+            let track_h = rows as f32 * line_h;
+            let track_y = PADDING;
+            instances.push(Quad {
+                rect: [track_x, track_y, 4.0, track_h],
+                color: linear(term::DEFAULT_FG, 0.10),
+            });
+            let visible_ratio = rows as f32 / self.term.total_lines() as f32;
+            let thumb_h = (track_h * visible_ratio).max(24.0).min(track_h);
+            let travel = track_h - thumb_h;
+            let pos = 1.0 - (self.scroll as f32 / history as f32);
+            instances.push(Quad {
+                rect: [track_x, track_y + travel * pos, 4.0, thumb_h],
+                color: linear(term::DEFAULT_FG, 0.45),
+            });
+        }
+
+        let cursor_visible = self.term.cursor_visible && self.scroll == 0 && window.has_focus();
         if cursor_visible {
             let (cx, cy) = self.term.cursor();
             let x = PADDING + cx as f32 * cell_w;
@@ -810,20 +885,70 @@ impl ApplicationHandler<UserEvent> for App {
                 if event.state != ElementState::Pressed {
                     return;
                 }
+
+                // Shift+PageUp/PageDown/Home/End drive the scrollback viewport
+                // instead of being forwarded to the application.
+                if self.modifiers.shift_key() && !self.modifiers.control_key() {
+                    let page = self.term.rows.saturating_sub(1).max(1) as i32;
+                    match event.logical_key {
+                        Key::Named(NamedKey::PageUp) => {
+                            self.scroll_by(page);
+                            return;
+                        }
+                        Key::Named(NamedKey::PageDown) => {
+                            self.scroll_by(-page);
+                            return;
+                        }
+                        Key::Named(NamedKey::Home) => {
+                            let max = self.term.scrollback_len();
+                            self.set_scroll(max);
+                            return;
+                        }
+                        Key::Named(NamedKey::End) => {
+                            self.jump_to_bottom();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
                 // Ctrl+V pastes; Ctrl+Shift+V is the same thing for muscle memory.
                 if self.modifiers.control_key() {
                     if let Key::Character(text) = &event.logical_key {
                         if text.eq_ignore_ascii_case("v") {
+                            self.jump_to_bottom();
                             self.bracket_paste();
                             return;
                         }
                     }
                 }
                 if let Some(bytes) = self.encode_key(&event) {
+                    // Typing always returns to the live screen, but modifier-only
+                    // presses must not disturb a scrolled-back viewport.
+                    self.jump_to_bottom();
                     self.write_pty(&bytes);
                 }
             }
+            WindowEvent::MouseWheel { delta, .. } => {
+                use winit::event::MouseScrollDelta;
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => (y * 3.0).round() as i32,
+                    MouseScrollDelta::PixelDelta(pos) => {
+                        let line_h = self
+                            .text
+                            .as_ref()
+                            .map(|t| t.line_height)
+                            .unwrap_or(20.0)
+                            .max(1.0);
+                        (pos.y as f32 / line_h).round() as i32
+                    }
+                };
+                if lines != 0 {
+                    self.scroll_by(lines);
+                }
+            }
             WindowEvent::Ime(Ime::Commit(text)) => {
+                self.jump_to_bottom();
                 self.write_pty(text.as_bytes());
             }
             WindowEvent::RedrawRequested => self.render(),

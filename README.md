@@ -30,16 +30,32 @@ cargo run --release       # optimised
 | Cursor position / device attribute replies (`DSR`, `DA`) | ✅ |
 | Keyboard incl. F1–F12, arrows, Home/End/PgUp/PgDn | ✅ |
 | Ctrl+V / Ctrl+Shift+V paste | ✅ |
+| Bracketed paste (`?2004`) | ✅ |
+| Scrollback (10 000 lines) + mouse wheel, Shift+PgUp/PgDn/Home/End | ✅ (overlay scrollbar) |
 | DPI scaling | ✅ |
 | Unit tests for the VT state machine | ✅ (`cargo test`) |
 
+## Scrolling
+
+The primary screen keeps up to 10 000 scrolled-off lines. The alternate screen
+(vim, less, htop) never writes to history, so full-screen apps behave normally.
+
+| Input | Action |
+| --- | --- |
+| Mouse wheel | 3 lines per notch |
+| Shift+PageUp / Shift+PageDown | One page |
+| Shift+Home / Shift+End | Top of history / live screen |
+| Any keystroke | Jumps back to the live screen |
+
+While scrolled back, a thin overlay scrollbar appears on the right and the
+viewport stays anchored if new output arrives.
+
 ## What is missing (the honest list)
 
-- **Scrollback.** The grid has no history buffer yet; scrolling up with the wheel does nothing.
 - Tabs, splits, multiple windows.
 - Mouse reporting (clicks are not forwarded to applications).
 - OSC 8 hyperlinks, OSC 52 clipboard, OSC 7 cwd.
-- Bracketed paste mode, focus reporting, sync output.
+- Focus reporting, synchronized output.
 - Config file / themes / font selection (font is the system monospace at 15px).
 - Reflow on resize (content is preserved top-left, not rewrapped).
 - Scroll regions (`DECSTBM`), tab stops beyond every 8 columns.
@@ -96,7 +112,7 @@ cargo run
 
 ## Roadmap to something you could daily-drive
 
-1. **Scrollback + scroll wheel** — ring buffer of scrolled-off lines, viewport offset in the renderer.
+1. ~~Scrollback + scroll wheel~~ — done.
 2. **Mouse reporting** — SGR 1006 and friends.
 3. **Config** — TOML file for font family/size, theme colors, padding, cursor style.
 4. **Resize reflow** — rewrap logical lines instead of cropping.

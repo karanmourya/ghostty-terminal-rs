@@ -4,8 +4,13 @@
 //! it owns the screen grid and implements `vte::Perform` so the `vte` crate
 //! can drive it with parsed escape sequences.
 
+use std::collections::VecDeque;
+
 use unicode_width::UnicodeWidthChar;
 use vte::{Params, Perform};
+
+/// Maximum number of scrolled-off lines kept in history.
+pub const SCROLLBACK_LIMIT: usize = 10_000;
 
 pub const DEFAULT_FG: [u8; 3] = [0xcc, 0xcc, 0xcc];
 pub const DEFAULT_BG: [u8; 3] = [0x0c, 0x0c, 0x0c];
@@ -78,6 +83,8 @@ pub struct Term {
     pub cols: usize,
     pub rows: usize,
     cells: Vec<Cell>,
+    /// Lines that scrolled off the top of the visible grid.
+    scrollback: VecDeque<Vec<Cell>>,
     cx: usize,
     cy: usize,
     fg: [u8; 3],
@@ -92,6 +99,7 @@ pub struct Term {
     saved_cursor: Option<(usize, usize)>,
     pub cursor_visible: bool,
     pub app_cursor_keys: bool,
+    pub bracketed_paste: bool,
     pub title: Option<String>,
     responses: Vec<Vec<u8>>,
     dirty: bool,
@@ -105,6 +113,7 @@ impl Term {
             cols,
             rows,
             cells: vec![Cell::default(); cols * rows],
+            scrollback: VecDeque::new(),
             cx: 0,
             cy: 0,
             fg: DEFAULT_FG,
@@ -117,6 +126,7 @@ impl Term {
             saved_cursor: None,
             cursor_visible: true,
             app_cursor_keys: false,
+            bracketed_paste: false,
             title: None,
             responses: Vec::new(),
             dirty: true,
@@ -139,6 +149,8 @@ impl Term {
         std::mem::take(&mut self.responses)
     }
 
+    /// Grid accessor used by tests (rendering goes through [`Term::line`]).
+    #[allow(dead_code)]
     pub fn cell(&self, x: usize, y: usize) -> &Cell {
         &self.cells[y * self.cols + x]
     }
@@ -147,17 +159,51 @@ impl Term {
         (self.cx, self.cy)
     }
 
+    /// Number of lines currently held in history.
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    /// Total addressable lines: history followed by the visible grid.
+    pub fn total_lines(&self) -> usize {
+        self.scrollback.len() + self.rows
+    }
+
+    /// Fetch a line by absolute index (`0` is the oldest scrollback line).
+    /// Returns `None` when the index is out of range.
+    pub fn line(&self, index: usize) -> Option<&[Cell]> {
+        let history = self.scrollback.len();
+        if index < history {
+            return self.scrollback.get(index).map(|line| line.as_slice());
+        }
+        let row = index - history;
+        if row >= self.rows {
+            return None;
+        }
+        let start = row * self.cols;
+        Some(&self.cells[start..start + self.cols])
+    }
+
     pub fn resize(&mut self, cols: usize, rows: usize) {
         let cols = cols.max(1);
         let rows = rows.max(1);
         if cols == self.cols && rows == self.rows {
             return;
         }
+        let old_cols = self.cols;
+        let old_rows = self.rows;
         let mut next = vec![Cell::default(); cols * rows];
         // Preserve top-left content; proper reflow is future work.
-        for y in 0..rows.min(self.rows) {
-            for x in 0..cols.min(self.cols) {
-                next[y * cols + x] = self.cells[y * self.cols + x];
+        for y in 0..rows.min(old_rows) {
+            for x in 0..cols.min(old_cols) {
+                next[y * cols + x] = self.cells[y * old_cols + x];
+            }
+        }
+        // History lines are stored width-agnostic; pad or crop them so every
+        // line matches `cols` after a resize.
+        if cols != old_cols {
+            for line in self.scrollback.iter_mut() {
+                line.resize(cols, Cell::default());
             }
         }
         self.cells = next;
@@ -178,10 +224,26 @@ impl Term {
         if n == 0 {
             return;
         }
+        // Only the primary screen feeds scrollback; the alternate screen
+        // (vim, less, htop) must not pollute history.
+        if self.saved.is_none() {
+            for row in 0..n {
+                self.push_history_row(row);
+            }
+        }
         self.cells.copy_within(n * self.cols.., 0);
         for c in self.cells[(self.rows - n) * self.cols..].iter_mut() {
             *c = Cell::default();
         }
+    }
+
+    fn push_history_row(&mut self, row: usize) {
+        if self.scrollback.len() >= SCROLLBACK_LIMIT {
+            self.scrollback.pop_front();
+        }
+        let start = row * self.cols;
+        self.scrollback
+            .push_back(self.cells[start..start + self.cols].to_vec());
     }
 
     fn scroll_down(&mut self, count: usize) {
@@ -315,6 +377,7 @@ impl Term {
         match mode {
             1 => self.app_cursor_keys = enabled,
             25 => self.cursor_visible = enabled,
+            2004 => self.bracketed_paste = enabled,
             47 | 1047 | 1049 => {
                 if enabled {
                     if self.saved.is_none() {
@@ -521,6 +584,7 @@ impl Perform for Term {
                 self.wrap_pending = false;
                 self.cursor_visible = true;
                 self.app_cursor_keys = false;
+                self.bracketed_paste = false;
                 self.reset_pen();
             }
             b'D' => self.linefeed(),
@@ -572,6 +636,19 @@ mod tests {
             .to_string()
     }
 
+    /// Text of an absolute line (scrollback followed by the visible grid).
+    fn line_text(t: &Term, index: usize) -> String {
+        t.line(index)
+            .map(|line| {
+                line.iter()
+                    .map(|c| c.ch)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .unwrap_or_default()
+    }
+
     fn feed(t: &mut Term, s: &str) {
         let mut parser = vte::Parser::new();
         t.feed(&mut parser, s.as_bytes());
@@ -600,6 +677,54 @@ mod tests {
         feed(&mut t, "a\r\nb\r\nc");
         assert_eq!(row_text(&t, 0), "b");
         assert_eq!(row_text(&t, 1), "c");
+    }
+
+    #[test]
+    fn scrollback_keeps_scrolled_off_lines() {
+        let mut t = Term::new(6, 2);
+        feed(&mut t, "one\r\ntwo\r\nthree\r\nfour");
+        assert_eq!(t.scrollback_len(), 2);
+        assert_eq!(t.total_lines(), 4);
+        assert_eq!(line_text(&t, 0), "one");
+        assert_eq!(line_text(&t, 1), "two");
+        assert_eq!(line_text(&t, 2), "three");
+        assert_eq!(line_text(&t, 3), "four");
+        assert!(t.line(4).is_none());
+    }
+
+    #[test]
+    fn alternate_screen_does_not_pollute_history() {
+        let mut t = Term::new(4, 2);
+        feed(&mut t, "keep\r\n");
+        assert_eq!(t.scrollback_len(), 0);
+        feed(&mut t, "\x1b[?1049h");
+        feed(&mut t, "a\r\nb\r\nc\r\nd");
+        assert_eq!(t.scrollback_len(), 0);
+        feed(&mut t, "\x1b[?1049l");
+        assert_eq!(line_text(&t, 0), "keep");
+    }
+
+    #[test]
+    fn scrollback_survives_resize() {
+        let mut t = Term::new(4, 2);
+        feed(&mut t, "abcdef\r\ngh\r\nij\r\nkl");
+        let before = t.scrollback_len();
+        assert!(before > 0);
+        t.resize(8, 3);
+        assert_eq!(t.scrollback_len(), before);
+        // Every history line must match the new width.
+        for i in 0..t.scrollback_len() {
+            assert_eq!(t.line(i).unwrap().len(), 8);
+        }
+    }
+
+    #[test]
+    fn bracketed_paste_mode_tracks_private_mode() {
+        let mut t = Term::new(10, 2);
+        feed(&mut t, "\x1b[?2004h");
+        assert!(t.bracketed_paste);
+        feed(&mut t, "\x1b[?2004l");
+        assert!(!t.bracketed_paste);
     }
 
     #[test]
