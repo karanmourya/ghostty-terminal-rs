@@ -355,6 +355,10 @@ struct App {
 
     /// Last known pointer position, in grid cells.
     pointer_cell: (usize, usize),
+    /// Last known pointer position in window pixels (for edge auto-scroll).
+    pointer_physical: Option<(f64, f64)>,
+    /// Last auto-scroll step, used to pace scrolling while dragging.
+    last_autoscroll: Instant,
     /// Button currently held (xterm button code) while reporting motion.
     mouse_down: Option<u8>,
     /// Active text selection and whether the pointer is dragging it out.
@@ -383,6 +387,8 @@ impl App {
         let mut term = Term::new(80, 24);
         term.set_theme(config.foreground, config.background, config.palette);
         term.set_scrollback_limit(config.scrollback);
+        term.osc52_write = config.clipboard_write;
+        term.osc52_read = config.clipboard_read;
         Self {
             gpu: None,
             text: None,
@@ -397,6 +403,8 @@ impl App {
             rx: None,
             scroll: 0,
             pointer_cell: (0, 0),
+            pointer_physical: None,
+            last_autoscroll: Instant::now(),
             mouse_down: None,
             selection: None,
             selecting: false,
@@ -470,20 +478,18 @@ impl App {
 
     // -- mouse reporting ---------------------------------------------------
 
-    fn cell_at(&self, x: f64, y: f64) -> (usize, usize) {
+    /// Grid position with a signed row: negative above the window, and rows
+    /// past the bottom edge report beyond the last row. Selection dragging
+    /// uses this to auto-scroll; mouse reports use the clamped version.
+    fn cell_at_signed(&self, x: f64, y: f64) -> (usize, i32) {
         let Some(text) = self.text.as_ref() else {
             return (0, 0);
         };
         let col = ((x as f32 - self.config.padding) / text.cell_width)
             .floor()
             .max(0.0) as usize;
-        let row = ((y as f32 - self.config.padding) / text.line_height)
-            .floor()
-            .max(0.0) as usize;
-        (
-            col.min(self.term.cols.saturating_sub(1)),
-            row.min(self.term.rows.saturating_sub(1)),
-        )
+        let row = ((y as f32 - self.config.padding) / text.line_height).floor() as i32;
+        (col.min(self.term.cols.saturating_sub(1)), row)
     }
 
     /// Encode an xterm mouse report, or `None` when the application did not
@@ -531,6 +537,12 @@ impl App {
     fn absolute_cell(&self, cell: (usize, usize)) -> (usize, usize) {
         let top = self.term.scrollback_len().saturating_sub(self.scroll);
         (top + cell.1, cell.0)
+    }
+
+    /// Absolute line for a signed viewport row, clamped to the buffer.
+    fn absolute_row(&self, row: i32) -> usize {
+        let top = self.term.scrollback_len().saturating_sub(self.scroll);
+        absolute_row_for(top, row, self.term.total_lines())
     }
 
     fn set_selection(&mut self, selection: Option<Selection>) {
@@ -593,19 +605,52 @@ impl App {
         })
     }
 
-    fn update_selection(&mut self, cell: (usize, usize)) {
+    fn update_selection_row(&mut self, col: usize, row: i32) {
         if !self.selecting {
             return;
         }
         let Some(sel) = self.selection else {
             return;
         };
-        let head = self.absolute_cell(cell);
+        let head = (self.absolute_row(row), col);
         if head != sel.head {
             self.set_selection(Some(Selection {
                 anchor: sel.anchor,
                 head,
             }));
+        }
+    }
+
+    /// One auto-scroll step while a selection drag sits past an edge.
+    /// Returns `true` when the viewport moved.
+    fn autoscroll_step(&mut self) -> bool {
+        if !self.selecting {
+            return false;
+        }
+        let Some((px, y)) = self.pointer_physical else {
+            return false;
+        };
+        let Some(text) = self.text.as_ref() else {
+            return false;
+        };
+        let top_edge = self.config.padding as f64;
+        let bottom_edge =
+            self.config.padding as f64 + self.term.rows as f64 * text.line_height as f64;
+        let (col, _) = self.cell_at_signed(px, y);
+        if y < top_edge {
+            // Dragging above the window: reveal older lines.
+            let before = self.scroll;
+            self.scroll_by(1);
+            self.update_selection_row(col, 0);
+            self.scroll != before
+        } else if y > bottom_edge {
+            // Dragging below the window: reveal newer lines.
+            let before = self.scroll;
+            self.scroll_by(-1);
+            self.update_selection_row(col, self.term.rows as i32 - 1);
+            self.scroll != before
+        } else {
+            false
         }
     }
 
@@ -617,9 +662,7 @@ impl App {
 
     fn copy_selection(&mut self) {
         if let Some(text) = self.selection_text() {
-            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                let _ = clipboard.set_text(text);
-            }
+            set_clipboard(&text);
         }
     }
 
@@ -728,6 +771,15 @@ impl App {
             for response in self.term.take_responses() {
                 self.write_pty(&response);
             }
+            // OSC 52: applications writing to (or querying) the clipboard.
+            for text in self.term.take_clipboard_writes() {
+                set_clipboard(&text);
+            }
+            if self.term.take_clipboard_query() {
+                let text = get_clipboard().unwrap_or_default();
+                let reply = format!("\x1b]52;c;{}\x1b\\", term::base64_encode(text.as_bytes()));
+                self.write_pty(reply.as_bytes());
+            }
             if let (Some(text), Some(window)) = (self.text.as_mut(), self.window.as_ref()) {
                 text.buffer = None;
                 window.request_redraw();
@@ -816,16 +868,14 @@ impl App {
     }
 
     fn bracket_paste(&mut self) {
-        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-            if let Ok(text) = clipboard.get_text() {
-                let normalized = text.replace("\r\n", "\r");
-                if self.term.bracketed_paste {
-                    self.write_pty(b"\x1b[200~");
-                    self.write_pty(normalized.as_bytes());
-                    self.write_pty(b"\x1b[201~");
-                } else {
-                    self.write_pty(normalized.as_bytes());
-                }
+        if let Some(text) = get_clipboard() {
+            let normalized = text.replace("\r\n", "\r");
+            if self.term.bracketed_paste {
+                self.write_pty(b"\x1b[200~");
+                self.write_pty(normalized.as_bytes());
+                self.write_pty(b"\x1b[201~");
+            } else {
+                self.write_pty(normalized.as_bytes());
             }
         }
     }
@@ -1282,13 +1332,17 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let cell = self.cell_at(position.x, position.y);
-                if cell == self.pointer_cell {
+                self.pointer_physical = Some((position.x, position.y));
+                let (col, row) = self.cell_at_signed(position.x, position.y);
+                let cell = (col, row.max(0) as usize);
+                if cell == self.pointer_cell && !self.selecting {
                     return;
                 }
                 self.pointer_cell = cell;
                 if self.selecting {
-                    self.update_selection(cell);
+                    // Use the signed row so dragging past an edge clamps the
+                    // head to the buffer instead of sticking to the last cell.
+                    self.update_selection_row(col, row);
                 } else {
                     self.report_motion();
                 }
@@ -1336,9 +1390,20 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // Belt-and-braces: also drain here in case a wake event coalesced.
         self.drain_pty();
+        // While a selection drag sits past the top/bottom edge, poll the loop
+        // so the viewport keeps scrolling under the pointer.
+        if self.selecting {
+            event_loop.set_control_flow(ControlFlow::Poll);
+            if self.last_autoscroll.elapsed() >= Duration::from_millis(25) {
+                self.last_autoscroll = Instant::now();
+                self.autoscroll_step();
+            }
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
     }
 }
 
@@ -1413,6 +1478,29 @@ fn selection_text(term: &Term, sel: Selection) -> Option<String> {
     } else {
         Some(out)
     }
+}
+
+/// Map a signed viewport row onto an absolute line index, clamped to the
+/// buffer (negative rows stick to the oldest line, past-the-end rows to the
+/// newest).
+fn absolute_row_for(top: usize, row: i32, total: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    let line = top as i64 + i64::from(row);
+    line.clamp(0, total.saturating_sub(1) as i64) as usize
+}
+
+fn set_clipboard(text: &str) {
+    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+        let _ = clipboard.set_text(text.to_string());
+    }
+}
+
+fn get_clipboard() -> Option<String> {
+    arboard::Clipboard::new()
+        .ok()
+        .and_then(|mut clipboard| clipboard.get_text().ok())
 }
 
 fn mouse_button_code(button: MouseButton) -> Option<u8> {
@@ -1507,6 +1595,24 @@ mod selection_tests {
             head: (0, 3),
         };
         assert_eq!(selection_text(&term, sel).as_deref(), Some("日本"));
+    }
+
+    #[test]
+    fn signed_rows_clamp_to_the_buffer() {
+        // 100 lines of history, 25 visible, viewport at the bottom.
+        assert_eq!(absolute_row_for(100, 0, 125), 100);
+        assert_eq!(absolute_row_for(100, 24, 125), 124);
+        // Dragged above the window: sticks to the oldest line, not underflow.
+        assert_eq!(absolute_row_for(100, -1, 125), 99);
+        assert_eq!(absolute_row_for(100, -500, 125), 0);
+        // Dragged below the window: sticks to the newest line.
+        assert_eq!(absolute_row_for(100, 25, 125), 124);
+        assert_eq!(absolute_row_for(100, 500, 125), 124);
+        // Scrolled to the top of history.
+        assert_eq!(absolute_row_for(0, -3, 125), 0);
+        assert_eq!(absolute_row_for(0, 0, 125), 0);
+        // Empty buffer never panics.
+        assert_eq!(absolute_row_for(0, -3, 0), 0);
     }
 
     #[test]

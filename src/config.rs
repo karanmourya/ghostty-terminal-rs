@@ -42,6 +42,10 @@ pub struct Config {
     pub padding: f32,
     pub cursor_style: CursorStyle,
     pub scrollback: usize,
+    /// Whether apps may set the clipboard via OSC 52.
+    pub clipboard_write: bool,
+    /// Whether apps may read the clipboard via an OSC 52 `?` query.
+    pub clipboard_read: bool,
 }
 
 impl Default for Config {
@@ -55,6 +59,8 @@ impl Default for Config {
             padding: 6.0,
             cursor_style: CursorStyle::Block,
             scrollback: SCROLLBACK_LIMIT,
+            clipboard_write: true,
+            clipboard_read: true,
         }
     }
 }
@@ -169,6 +175,20 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
                 }
                 None => warnings.push(format!("line {}: unknown theme `{value}`", index + 1)),
             },
+            "clipboard-write" | "clipboard-read" => {
+                let flag = match value {
+                    "true" | "yes" | "on" => Some(true),
+                    "false" | "no" | "off" => Some(false),
+                    _ => None,
+                };
+                match flag {
+                    Some(on) if key == "clipboard-write" => config.clipboard_write = on,
+                    Some(on) => config.clipboard_read = on,
+                    None => {
+                        warnings.push(format!("line {}: `{key}` expects true or false", index + 1))
+                    }
+                }
+            }
             _ => warnings.push(format!("line {}: unknown key `{key}`", index + 1)),
         }
     }
@@ -354,6 +374,17 @@ mod tests {
         assert_eq!(config.font_size, 15.0);
         assert_eq!(config.background, DEFAULT_BG);
         assert_eq!(warnings.len(), 4);
+    }
+
+    #[test]
+    fn clipboard_gates_parse() {
+        let (config, warnings) = parse("clipboard-write = false\nclipboard-read = off");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(!config.clipboard_write);
+        assert!(!config.clipboard_read);
+        let (config, warnings) = parse("clipboard-write = maybe");
+        assert_eq!(warnings.len(), 1);
+        assert!(config.clipboard_write);
     }
 
     #[test]

@@ -130,6 +130,13 @@ pub struct Term {
     /// Focus in/out reporting (`?1004`).
     pub focus_reporting: bool,
     pub title: Option<String>,
+    /// Texts queued by OSC 52 for the app to put on the clipboard.
+    clipboard_writes: Vec<String>,
+    /// Set when an app queries the clipboard with OSC 52 `?`.
+    clipboard_query: bool,
+    /// Whether OSC 52 writes / read-queries are honoured.
+    pub osc52_write: bool,
+    pub osc52_read: bool,
     responses: Vec<Vec<u8>>,
     dirty: bool,
 }
@@ -166,6 +173,10 @@ impl Term {
             mouse_sgr: false,
             focus_reporting: false,
             title: None,
+            clipboard_writes: Vec::new(),
+            clipboard_query: false,
+            osc52_write: true,
+            osc52_read: true,
             responses: Vec::new(),
             dirty: true,
         }
@@ -238,6 +249,16 @@ impl Term {
 
     pub fn take_responses(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.responses)
+    }
+
+    /// Texts an application asked to place on the clipboard via OSC 52.
+    pub fn take_clipboard_writes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.clipboard_writes)
+    }
+
+    /// Whether an application queried the clipboard via OSC 52 `?`.
+    pub fn take_clipboard_query(&mut self) -> bool {
+        std::mem::take(&mut self.clipboard_query)
     }
 
     /// Grid accessor used by tests (rendering goes through [`Term::line`]).
@@ -707,6 +728,8 @@ impl Perform for Term {
                 self.move_mouse = false;
                 self.mouse_sgr = false;
                 self.focus_reporting = false;
+                self.clipboard_writes.clear();
+                self.clipboard_query = false;
                 self.reset_pen();
             }
             b'D' => self.linefeed(),
@@ -742,8 +765,101 @@ impl Perform for Term {
                 self.dirty = true;
             }
         }
-        // TODO: OSC 8 hyperlinks, OSC 52 clipboard, OSC 7 cwd.
+        // OSC 52: clipboard. `params` arrives split on ';', so a write looks
+        // like ["52", "c", "<base64>"] (the selection field may hold several
+        // ':'-separated targets, or be empty for the system clipboard).
+        if params.first().is_some_and(|p| *p == b"52") {
+            let selection = params.get(1).copied().unwrap_or(b"");
+            let data = params.get(2).copied().unwrap_or(b"");
+            let targets_system_clipboard = selection.is_empty()
+                || selection.split(|b| *b == b':').any(|target| target == b"c");
+            if targets_system_clipboard {
+                if data == b"?" {
+                    if self.osc52_read {
+                        self.clipboard_query = true;
+                    }
+                } else if self.osc52_write {
+                    if let Some(text) = decode_osc52(data) {
+                        self.clipboard_writes.push(text);
+                    }
+                }
+            }
+        }
+        // TODO: OSC 8 hyperlinks, OSC 7 cwd.
     }
+}
+
+/// Decode the base64 payload of an OSC 52 sequence into clipboard text.
+fn decode_osc52(data: &[u8]) -> Option<String> {
+    let bytes = base64_decode(data)?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Standard base64 encoding (with padding), as used by OSC 52 replies.
+pub fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let n = chunk.len();
+        let triple = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        out.push(ALPHABET[(triple[0] >> 2) as usize] as char);
+        out.push(ALPHABET[(((triple[0] & 0x03) << 4) | (triple[1] >> 4)) as usize] as char);
+        out.push(if n > 1 {
+            ALPHABET[(((triple[1] & 0x0f) << 2) | (triple[2] >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if n > 2 {
+            ALPHABET[(triple[2] & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Standard base64 decoding; `None` on malformed input.
+fn base64_decode(data: &[u8]) -> Option<Vec<u8>> {
+    fn value(b: u8) -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(data.len() / 4 * 3);
+    let mut quads = data.chunks_exact(4);
+    for quad in &mut quads {
+        let padding = quad.iter().filter(|b| **b == b'=').count();
+        if padding > 0 && quad[..4 - padding].contains(&b'=') {
+            return None;
+        }
+        let mut acc: u32 = 0;
+        for b in quad.iter() {
+            acc <<= 6;
+            if *b != b'=' {
+                acc |= u32::from(value(*b)?);
+            }
+        }
+        out.push((acc >> 16) as u8);
+        if padding < 2 {
+            out.push((acc >> 8) as u8);
+        }
+        if padding < 1 {
+            out.push(acc as u8);
+        }
+    }
+    if !quads.remainder().is_empty() {
+        return None;
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -908,6 +1024,66 @@ mod tests {
         let mut t = Term::new(10, 2);
         feed(&mut t, "abcdef\x1b[3D\x1b[K");
         assert_eq!(row_text(&t, 0), "abc");
+    }
+
+    #[test]
+    fn base64_round_trip() {
+        for text in [
+            "",
+            "f",
+            "fo",
+            "foo",
+            "hello world",
+            "日本語",
+            "a".repeat(100).as_str(),
+        ] {
+            let encoded = base64_encode(text.as_bytes());
+            assert_eq!(base64_decode(encoded.as_bytes()).unwrap(), text.as_bytes());
+        }
+        // Known vector: "hello" -> "aGVsbG8="
+        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
+        assert_eq!(base64_decode(b"aGVsbG8=").unwrap(), b"hello");
+        assert_eq!(base64_decode(b"!!!"), None);
+        assert_eq!(base64_decode(b"abc"), None);
+    }
+
+    #[test]
+    fn osc52_write_queues_clipboard_text() {
+        let mut t = Term::new(10, 3);
+        feed(&mut t, "\x1b]52;c;aGVsbG8=\x1b\\");
+        assert_eq!(t.take_clipboard_writes(), vec!["hello".to_string()]);
+        // Empty selection field also means the system clipboard.
+        feed(&mut t, "\x1b]52;;d29ybGQ=\x07");
+        assert_eq!(t.take_clipboard_writes(), vec!["world".to_string()]);
+    }
+
+    #[test]
+    fn osc52_query_and_gates() {
+        let mut t = Term::new(10, 3);
+        feed(&mut t, "\x1b]52;c;?\x1b\\");
+        assert!(t.take_clipboard_query());
+        assert!(!t.take_clipboard_query());
+
+        // Writes disabled: ignored.
+        t.osc52_write = false;
+        feed(&mut t, "\x1b]52;c;aGVsbG8=\x1b\\");
+        assert!(t.take_clipboard_writes().is_empty());
+
+        // Reads disabled: query ignored.
+        t.osc52_read = false;
+        feed(&mut t, "\x1b]52;c;?\x1b\\");
+        assert!(!t.take_clipboard_query());
+    }
+
+    #[test]
+    fn osc52_ignores_primary_selection_and_garbage() {
+        let mut t = Term::new(10, 3);
+        // 'p' is the primary selection, not the clipboard.
+        feed(&mut t, "\x1b]52;p;aGVsbG8=\x1b\\");
+        assert!(t.take_clipboard_writes().is_empty());
+        // Malformed base64 is dropped, not panicked on.
+        feed(&mut t, "\x1b]52;c;%%%\x1b\\");
+        assert!(t.take_clipboard_writes().is_empty());
     }
 
     #[test]

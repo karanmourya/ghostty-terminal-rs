@@ -16,3 +16,5 @@ font-size = 15
 padding = 6
 cursor-style = block  # block | bar | underline
 scrollback-limit = 10000
+clipboard-write = true   # allow apps to set the clipboard via OSC 52
+clipboard-read = true    # allow apps to query the clipboard via OSC 52 ?

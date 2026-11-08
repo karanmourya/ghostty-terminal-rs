@@ -34,6 +34,7 @@ cargo run --release       # optimised
 | Mouse reporting: `?1000`/`?1002`/`?1003`, SGR `?1006` and legacy X10 | ✅ |
 | Focus reporting (`?1004`) | ✅ |
 | Drag / double-click selection, copy-on-select, Ctrl+Shift+C | ✅ |
+| OSC 52 clipboard (write, `?` read-query; gated by `clipboard-write`/`clipboard-read`) | ✅ |
 | Scrollback (10 000 lines) + mouse wheel, Shift+PgUp/PgDn/Home/End | ✅ (overlay scrollbar) |
 | DPI scaling | ✅ |
 | Config file, themes, font size/family, padding, cursor style | ✅ |
@@ -73,10 +74,19 @@ is copied to the clipboard when you release the mouse. Ctrl+Shift+C copies it
 again; typing or clicking elsewhere clears it. When an application has enabled
 mouse reporting, hold **Shift** to select instead of forwarding the drag.
 
+Drag past the top or bottom edge of the window and the viewport auto-scrolls
+through history (and back down) until you release.
+
+## Clipboard (OSC 52)
+
+Applications can set the clipboard with `OSC 52 ; c ; <base64>` and read it
+back with `OSC 52 ; c ; ?`. Both are enabled by default and can be turned off
+with `clipboard-write = false` / `clipboard-read = false` in the config file.
+
 ## What is missing (the honest list)
 
 - Tabs, splits, multiple windows.
-- OSC 52 clipboard, selection auto-scroll past the window edges.
+- Triple-click line selection.
 - OSC 8 hyperlinks, OSC 7 cwd.
 - Synchronized output (`?2026`).
 - Search, scrollback export.
@@ -168,7 +178,7 @@ cargo run --release
 2. ~~Mouse reporting~~ — done.
 3. ~~Selection + clipboard~~ — done.
 4. ~~Config~~ — done.
-5. **Clipboard polish** — OSC 52, drag auto-scroll past the window edges.
+5. ~~Clipboard polish~~ — OSC 52 and auto-scroll done (triple-click still open).
 6. **Resize reflow** — rewrap logical lines instead of cropping.
 7. **Tabs/splits** — requires a window manager layer above `winit` windows.
 8. **Performance pass** — dirty-row tracking, glyph cache reuse, frame pacing.
