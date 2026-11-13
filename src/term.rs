@@ -119,6 +119,8 @@ pub struct Term {
     /// Vertical scrolling region (`DECSTBM`), inclusive row indices.
     scroll_top: usize,
     scroll_bottom: usize,
+    /// Horizontal tab stops (HTS/TBC/CHT/CBT). Defaults to every 8 columns.
+    tab_stops: Vec<bool>,
     cx: usize,
     cy: usize,
     fg: [u8; 3],
@@ -180,6 +182,7 @@ impl Term {
             row_wrapped: vec![false; rows],
             scroll_top: 0,
             scroll_bottom: rows - 1,
+            tab_stops: Self::default_tab_stops(cols),
             cx: 0,
             cy: 0,
             fg: DEFAULT_FG,
@@ -219,6 +222,41 @@ impl Term {
     /// A cell with the current default colours.
     fn blank(&self) -> Cell {
         Cell::blank(self.default_fg, self.default_bg)
+    }
+
+    fn default_tab_stops(cols: usize) -> Vec<bool> {
+        (0..cols).map(|c| c % 8 == 0).collect()
+    }
+
+    fn reset_tab_stops(&mut self) {
+        self.tab_stops = Self::default_tab_stops(self.cols);
+    }
+
+    fn tab_forward(&mut self, count: usize) {
+        for _ in 0..count.max(1) {
+            let mut x = self.cx + 1;
+            while x < self.cols && !self.tab_stops.get(x).copied().unwrap_or(false) {
+                x += 1;
+            }
+            self.cx = if x < self.cols { x } else { self.cols - 1 };
+        }
+        self.wrap_pending = false;
+    }
+
+    fn tab_backward(&mut self, count: usize) {
+        for _ in 0..count.max(1) {
+            if self.cx == 0 {
+                break;
+            }
+            let mut x = self.cx - 1;
+            while x > 0 && !self.tab_stops.get(x).copied().unwrap_or(false) {
+                x -= 1;
+            }
+            if self.tab_stops.get(x).copied().unwrap_or(false) {
+                self.cx = x;
+            }
+        }
+        self.wrap_pending = false;
     }
 
     /// Cell used by the renderer for lines that do not exist yet.
@@ -408,6 +446,7 @@ impl Term {
         self.rows = rows;
         self.scroll_top = 0;
         self.scroll_bottom = rows - 1;
+        self.reset_tab_stops();
         self.cx = self.cx.min(cols - 1);
         self.cy = self.cy.min(rows - 1);
         self.wrap_pending = false;
@@ -528,6 +567,7 @@ impl Term {
         // Margins are geometry: drop back to the full screen on resize.
         self.scroll_top = 0;
         self.scroll_bottom = rows - 1;
+        self.reset_tab_stops();
         self.cx = self.cx.min(cols - 1);
         self.cy = self.cy.min(rows - 1);
         self.wrap_pending = false;
@@ -836,11 +876,7 @@ impl Perform for Term {
                 self.cx = 0;
                 self.wrap_pending = false;
             }
-            b'\t' => {
-                let next = ((self.cx / 8) + 1) * 8;
-                self.cx = next.min(self.cols - 1);
-                self.wrap_pending = false;
-            }
+            b'\t' => self.tab_forward(1),
             0x08 => {
                 if self.cx > 0 {
                     self.cx -= 1;
@@ -877,6 +913,17 @@ impl Perform for Term {
                 self.cx = arg(1, 1).saturating_sub(1).min(self.cols - 1);
                 self.wrap_pending = false;
             }
+            'I' => self.tab_forward(arg(0, 1)),
+            'Z' => self.tab_backward(arg(0, 1)),
+            'g' => match p.first().copied().unwrap_or(0) {
+                0 => {
+                    if let Some(s) = self.tab_stops.get_mut(self.cx) {
+                        *s = false;
+                    }
+                }
+                3 => self.tab_stops.fill(false),
+                _ => {}
+            },
             'A' => self.cy = self.cy.saturating_sub(arg(0, 1)),
             'B' => self.cy = (self.cy + arg(0, 1)).min(self.rows - 1),
             'C' => self.cx = (self.cx + arg(0, 1)).min(self.cols - 1),
@@ -1014,6 +1061,7 @@ impl Perform for Term {
                 self.current_link = 0;
                 self.scroll_top = 0;
                 self.scroll_bottom = self.rows - 1;
+                self.reset_tab_stops();
                 self.reset_pen();
             }
             b'D' => self.linefeed(),
@@ -1026,6 +1074,12 @@ impl Perform for Term {
                     self.cy -= 1;
                 } else if self.cy == self.scroll_top {
                     self.scroll_down(1);
+                }
+            }
+            b'H' => {
+                // HTS: set a tab stop at the cursor column.
+                if let Some(s) = self.tab_stops.get_mut(self.cx) {
+                    *s = true;
                 }
             }
             b'7' => {
@@ -1555,6 +1609,26 @@ mod tests {
         t.set_scrollback_limit(1);
         assert_eq!(t.scrollback_len(), 1);
         assert_eq!(line_text(&t, 0), "two");
+    }
+
+    #[test]
+    fn tab_stops_can_be_set_cleared_and_moved() {
+        let mut t = Term::new(40, 2);
+        // HTS sets a custom stop at col 4 (CHA 5 is 1-based); HT from col 0 reaches it.
+        feed(&mut t, "A\x1b[5G\x1bHB");
+        assert_eq!(t.cursor().0, 5);
+        feed(&mut t, "\r\t");
+        assert_eq!(t.cursor().0, 4);
+        // CHT (CSI I) advances n stops; CBT (CSI Z) moves back.
+        feed(&mut t, "\x1b[2I");
+        assert_eq!(t.cursor().0, 16);
+        feed(&mut t, "\x1b[1Z");
+        assert_eq!(t.cursor().0, 8);
+        // TBC 0 clears stop at cursor; TBC 3 clears all (falls back to end).
+        feed(&mut t, "\x1b[9G\x1bg\t");
+        assert_eq!(t.cursor().0, 16);
+        feed(&mut t, "\r\x1b[3g\t");
+        assert_eq!(t.cursor().0, 39);
     }
 
     #[test]

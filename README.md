@@ -110,7 +110,7 @@ with `clipboard-write = false` / `clipboard-read = false` in the config file.
 - Tabs, splits, multiple windows.
 - OSC 7 cwd.
 - Search, scrollback export.
-- Tab stops beyond every 8 columns.
+- (none listed here currently beyond features above; see roadmap for larger items.)
 - Server/daemon mode, shell integration, notifications, kitty graphics protocol.
 
 ## Architecture
