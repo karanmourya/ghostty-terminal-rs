@@ -2154,7 +2154,54 @@ fn mouse_button_code(button: MouseButton) -> Option<u8> {
     }
 }
 
+fn server_loop() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = match TcpListener::bind("127.0.0.1:17865") {
+        Ok(l) => l,
+        Err(err) => {
+            eprintln!("ghostty-windows --server: failed to bind 127.0.0.1:17865: {err}");
+            return;
+        }
+    };
+    eprintln!("ghostty-windows server listening on 127.0.0.1:17865");
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { continue };
+        let mut buf = [0u8; 16];
+        let _ = stream.read(&mut buf);
+        if buf.first().copied() == Some(b'n') || buf.first().copied() == Some(b'N') {
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = std::process::Command::new(exe).spawn();
+            }
+            let _ = stream.write_all(b"ok");
+        }
+    }
+}
+
+fn try_new_window_via_server() -> bool {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    let Ok(mut stream) = TcpStream::connect("127.0.0.1:17865") else {
+        return false;
+    };
+    if stream.write_all(b"n").is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 8];
+    let _ = stream.read(&mut buf);
+    true
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--server") {
+        server_loop();
+        return;
+    }
+    if args.iter().any(|a| a == "--new-window") && try_new_window_via_server() {
+        return;
+    }
+
     let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
         Ok(event_loop) => event_loop,
         Err(err) => {

@@ -116,13 +116,14 @@ with `clipboard-write = false` / `clipboard-read = false` in the config file.
 - **Ctrl+Shift+T**: new tab (separate shell session). **Ctrl+Shift+W**: close tab (closes window on last tab).
 - **Ctrl+Tab** / **Ctrl+PageDown**: next tab. **Ctrl+Shift+Tab** / **Ctrl+PageUp**: previous tab.
 - **Ctrl+Shift+N**: open a new window (new process).
-- Functional sessions without a visual tab bar; splits are not implemented.
+- `--server`: runs a minimal daemon on `127.0.0.1:17865` that spawns windows on request. `--new-window`: asks a running server to open a window.
+- When multiple tabs are open, the active tab index is shown in the window title (e.g. `[2/3]`). No visual tab bar or in-window splits yet.
 
 ## What is missing (the honest list)
 
-- Visual tab bar and in-window splits.
-- Server/daemon mode.
-- Kitty graphics protocol (not implemented).
+- Visual in-window tab bar and pane splits (layout manager).
+- Full server/daemon protocol (current mode is a minimal local window-spawn server).
+- Kitty graphics rendering (APC image sequences are consumed by the parser but not decoded/displayed).
 
 ## Architecture
 
