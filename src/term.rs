@@ -45,7 +45,9 @@ pub struct Cell {
     pub fg: [u8; 3],
     pub bg: [u8; 3],
     pub bold: bool,
+    pub italic: bool,
     pub underline: bool,
+    pub strikethrough: bool,
     /// OSC 8 hyperlink id (0 = none), indexing the terminal's link table.
     pub link: u16,
 }
@@ -57,7 +59,9 @@ impl Default for Cell {
             fg: DEFAULT_FG,
             bg: DEFAULT_BG,
             bold: false,
+            italic: false,
             underline: false,
+            strikethrough: false,
             link: 0,
         }
     }
@@ -70,7 +74,9 @@ impl Cell {
             fg,
             bg,
             bold: false,
+            italic: false,
             underline: false,
+            strikethrough: false,
             link: 0,
         }
     }
@@ -133,7 +139,9 @@ pub struct Term {
     /// How many scrolled-off lines to keep.
     scrollback_limit: usize,
     bold: bool,
+    italic: bool,
     underline: bool,
+    strikethrough: bool,
     inverse: bool,
     wrap_pending: bool,
     /// Alternate-screen buffer (DEC set 47/1047/1049).
@@ -194,7 +202,9 @@ impl Term {
             palette: PALETTE,
             scrollback_limit: SCROLLBACK_LIMIT,
             bold: false,
+            italic: false,
             underline: false,
+            strikethrough: false,
             inverse: false,
             wrap_pending: false,
             saved: None,
@@ -681,7 +691,9 @@ impl Term {
             fg,
             bg,
             bold: self.bold,
+            italic: self.italic,
             underline: self.underline,
+            strikethrough: self.strikethrough,
             link: self.current_link,
         };
         // Wide characters occupy a continuation cell that the renderer skips.
@@ -692,7 +704,9 @@ impl Term {
                 fg,
                 bg,
                 bold: self.bold,
+                italic: self.italic,
                 underline: self.underline,
+                strikethrough: self.strikethrough,
                 link: self.current_link,
             };
         }
@@ -715,11 +729,15 @@ impl Term {
             match p[i] {
                 0 => self.reset_pen(),
                 1 => self.bold = true,
+                3 => self.italic = true,
                 4 => self.underline = true,
                 7 => self.inverse = true,
+                9 => self.strikethrough = true,
                 22 => self.bold = false,
+                23 => self.italic = false,
                 24 => self.underline = false,
                 27 => self.inverse = false,
+                29 => self.strikethrough = false,
                 30..=37 => self.fg = self.palette[(p[i] - 30) as usize],
                 40..=47 => self.bg = self.palette[(p[i] - 40) as usize],
                 39 => self.fg = self.default_fg,
@@ -756,7 +774,9 @@ impl Term {
         self.fg = self.default_fg;
         self.bg = self.default_bg;
         self.bold = false;
+        self.italic = false;
         self.underline = false;
+        self.strikethrough = false;
         self.inverse = false;
     }
 
@@ -1462,6 +1482,20 @@ mod tests {
         assert!(!t.focus_reporting);
         assert!(!t.mouse_sgr);
         assert_eq!(t.mouse_mode(), MouseMode::Off);
+    }
+
+    #[test]
+    fn italic_and_strikethrough_sgr() {
+        let mut t = Term::new(20, 2);
+        feed(&mut t, "\x1b[3;9mhi\x1b[23;29m!");
+        assert!(t.cell(0, 0).italic);
+        assert!(t.cell(0, 0).strikethrough);
+        assert!(!t.cell(2, 0).italic);
+        assert!(!t.cell(2, 0).strikethrough);
+        // Reset clears both.
+        feed(&mut t, "\x1b[3;9mX\x1b[0mY");
+        assert!(t.cell(3, 0).italic);
+        assert!(!t.cell(4, 0).italic);
     }
 
     #[test]

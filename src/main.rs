@@ -24,8 +24,8 @@ use config::{Config, CursorStyle};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use glyphon::{
-    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
-    TextArea, TextAtlas, TextBounds, TextRenderer as GlyphonRenderer, Viewport, Weight,
+    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
+    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer as GlyphonRenderer, Viewport, Weight,
 };
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use std::sync::Arc;
@@ -257,7 +257,7 @@ impl Text {
         }
         self.rows.truncate(term.rows);
 
-        let default_attrs = attrs(term.foreground(), false, false, &self.family);
+        let default_attrs = attrs(term.foreground(), false, false, false, false, &self.family);
         for y in 0..term.rows {
             let line = term.line(top + y);
             let mut hasher = DefaultHasher::new();
@@ -267,7 +267,7 @@ impl Text {
             // output shapes in one pass instead of one buffer per cell.
             let mut spans: Vec<(String, Attrs<'static>)> = Vec::new();
             let mut text = String::with_capacity(term.cols);
-            let mut current: Option<([u8; 3], bool, bool)> = None;
+            let mut current: Option<([u8; 3], bool, bool, bool, bool)> = None;
             for x in 0..term.cols {
                 // Missing lines (only possible mid-resize) render as blanks.
                 let cell = match line.and_then(|line| line.get(x)) {
@@ -281,23 +281,31 @@ impl Text {
                 cell.ch.hash(&mut hasher);
                 cell.fg.hash(&mut hasher);
                 cell.bold.hash(&mut hasher);
+                cell.italic.hash(&mut hasher);
                 cell.underline.hash(&mut hasher);
-                let style = (cell.fg, cell.bold, cell.underline);
+                cell.strikethrough.hash(&mut hasher);
+                let style = (
+                    cell.fg,
+                    cell.bold,
+                    cell.italic,
+                    cell.underline,
+                    cell.strikethrough,
+                );
                 if current != Some(style) {
-                    if let Some((fg, bold, underline)) = current {
+                    if let Some((fg, bold, italic, underline, strikethrough)) = current {
                         spans.push((
                             std::mem::take(&mut text),
-                            attrs(fg, bold, underline, &self.family),
+                            attrs(fg, bold, italic, underline, strikethrough, &self.family),
                         ));
                     }
                     current = Some(style);
                 }
                 text.push(cell.ch);
             }
-            if let Some((fg, bold, underline)) = current {
+            if let Some((fg, bold, italic, underline, strikethrough)) = current {
                 spans.push((
                     std::mem::take(&mut text),
-                    attrs(fg, bold, underline, &self.family),
+                    attrs(fg, bold, italic, underline, strikethrough, &self.family),
                 ));
             }
             let key = hasher.finish();
@@ -323,12 +331,22 @@ impl Text {
     }
 }
 
-fn attrs(fg: [u8; 3], bold: bool, _underline: bool, family: &Family<'static>) -> Attrs<'static> {
+fn attrs(
+    fg: [u8; 3],
+    bold: bool,
+    italic: bool,
+    _underline: bool,
+    _strikethrough: bool,
+    family: &Family<'static>,
+) -> Attrs<'static> {
     let mut a = Attrs::new()
         .family(*family)
         .color(Color::rgb(fg[0], fg[1], fg[2]));
     if bold {
         a = a.weight(Weight::BOLD);
+    }
+    if italic {
+        a = a.style(Style::Italic);
     }
     a
 }
@@ -1004,12 +1022,23 @@ impl App {
                         color: linear(cell.bg, 1.0),
                     });
                 }
-                // glyphon has no underline support, so draw it as a thin quad.
+                // glyphon has no underline/strikethrough support, so draw quads.
                 if cell.underline {
                     instances.push(Quad {
                         rect: [
                             padding + x as f32 * cell_w,
                             padding + y as f32 * line_h + line_h - 2.5,
+                            cell_w,
+                            1.5,
+                        ],
+                        color: linear(cell.fg, 1.0),
+                    });
+                }
+                if cell.strikethrough {
+                    instances.push(Quad {
+                        rect: [
+                            padding + x as f32 * cell_w,
+                            padding + y as f32 * line_h + (line_h * 0.55),
                             cell_w,
                             1.5,
                         ],
