@@ -36,6 +36,7 @@ cargo run --release       # optimised
 | Drag / double-click selection, copy-on-select, Ctrl+Shift+C | ✅ |
 | OSC 52 clipboard (write, `?` read-query; gated by `clipboard-write`/`clipboard-read`) | ✅ |
 | Scrollback (10 000 lines) + mouse wheel, Shift+PgUp/PgDn/Home/End | ✅ (overlay scrollbar) |
+| **Resize reflow** — soft-wrapped lines are joined and re-wrapped on resize | ✅ (wide glyphs never split) |
 | DPI scaling | ✅ |
 | Config file, themes, font size/family, padding, cursor style | ✅ |
 | Unit tests for the VT state machine and config parser | ✅ (`cargo test`) |
@@ -54,6 +55,16 @@ The primary screen keeps up to 10 000 scrolled-off lines. The alternate screen
 
 While scrolled back, a thin overlay scrollbar appears on the right and the
 viewport stays anchored if new output arrives.
+
+## Resize reflow
+
+Resizing the window re-wraps the content instead of cropping it. While text is
+written, the terminal remembers which lines ended in a soft wrap; on a resize
+those fragments are joined back into their logical lines and re-wrapped at the
+new width — including everything already in scrollback. Double-width glyphs
+(CJK, emoji) are never split across a line break, and reflowing an old
+alternate screen (e.g. you resized while vim was up) restores the primary
+screen correctly too.
 
 ## Mouse
 
@@ -90,7 +101,6 @@ with `clipboard-write = false` / `clipboard-read = false` in the config file.
 - OSC 8 hyperlinks, OSC 7 cwd.
 - Synchronized output (`?2026`).
 - Search, scrollback export.
-- Reflow on resize (content is preserved top-left, not rewrapped).
 - Scroll regions (`DECSTBM`), tab stops beyond every 8 columns.
 - Server/daemon mode, shell integration, notifications, kitty graphics protocol.
 
@@ -179,7 +189,7 @@ cargo run --release
 3. ~~Selection + clipboard~~ — done.
 4. ~~Config~~ — done.
 5. ~~Clipboard polish~~ — OSC 52 and auto-scroll done (triple-click still open).
-6. **Resize reflow** — rewrap logical lines instead of cropping.
+6. ~~Resize reflow~~ — soft-wrap join + re-wrap, verified live.
 7. **Tabs/splits** — requires a window manager layer above `winit` windows.
 8. **Performance pass** — dirty-row tracking, glyph cache reuse, frame pacing.
 

@@ -89,8 +89,19 @@ pub enum MouseMode {
 #[derive(Clone)]
 struct SavedScreen {
     cells: Vec<Cell>,
+    row_wrapped: Vec<bool>,
     cx: usize,
     cy: usize,
+    cols: usize,
+    rows: usize,
+}
+
+/// A line of history. `wrapped` marks a soft wrap: this line's content
+/// continues on the following line, so a resize may join and re-wrap them.
+#[derive(Clone)]
+struct HistLine {
+    cells: Vec<Cell>,
+    wrapped: bool,
 }
 
 pub struct Term {
@@ -98,7 +109,9 @@ pub struct Term {
     pub rows: usize,
     cells: Vec<Cell>,
     /// Lines that scrolled off the top of the visible grid.
-    scrollback: VecDeque<Vec<Cell>>,
+    scrollback: VecDeque<HistLine>,
+    /// Soft-wrap flag per visible row (this row continues onto the next).
+    row_wrapped: Vec<bool>,
     cx: usize,
     cy: usize,
     fg: [u8; 3],
@@ -150,6 +163,7 @@ impl Term {
             rows,
             cells: vec![Cell::blank(DEFAULT_FG, DEFAULT_BG); cols * rows],
             scrollback: VecDeque::new(),
+            row_wrapped: vec![false; rows],
             cx: 0,
             cy: 0,
             fg: DEFAULT_FG,
@@ -203,11 +217,11 @@ impl Term {
     /// Apply a theme and repaint whatever was using the old defaults.
     pub fn set_theme(&mut self, fg: [u8; 3], bg: [u8; 3], palette: [[u8; 3]; 16]) {
         let (old_fg, old_bg) = (self.default_fg, self.default_bg);
-        for cell in self
-            .cells
-            .iter_mut()
-            .chain(self.scrollback.iter_mut().flatten())
-        {
+        for cell in self.cells.iter_mut().chain(
+            self.scrollback
+                .iter_mut()
+                .flat_map(|line| line.cells.iter_mut()),
+        ) {
             if cell.fg == old_fg {
                 cell.fg = fg;
             }
@@ -299,7 +313,7 @@ impl Term {
     pub fn line(&self, index: usize) -> Option<&[Cell]> {
         let history = self.scrollback.len();
         if index < history {
-            return self.scrollback.get(index).map(|line| line.as_slice());
+            return self.scrollback.get(index).map(|line| line.cells.as_slice());
         }
         let row = index - history;
         if row >= self.rows {
@@ -315,30 +329,152 @@ impl Term {
         if cols == self.cols && rows == self.rows {
             return;
         }
+        if self.saved.is_some() {
+            // The alternate screen belongs to full-screen apps that redraw
+            // after the resize: crop/pad it, leaving scrollback alone.
+            self.crop_pad(cols, rows);
+        } else {
+            self.reflow(cols, rows);
+        }
+        self.dirty = true;
+    }
+
+    /// Old-style resize: keep top-left content and crop or pad. Used on the
+    /// alternate screen, whose apps redraw themselves anyway.
+    fn crop_pad(&mut self, cols: usize, rows: usize) {
         let old_cols = self.cols;
         let old_rows = self.rows;
         let blank = self.blank();
         let mut next = vec![blank; cols * rows];
-        // Preserve top-left content; proper reflow is future work.
         for y in 0..rows.min(old_rows) {
             for x in 0..cols.min(old_cols) {
                 next[y * cols + x] = self.cells[y * old_cols + x];
             }
         }
-        // History lines are stored width-agnostic; pad or crop them so every
-        // line matches `cols` after a resize.
-        if cols != old_cols {
-            for line in self.scrollback.iter_mut() {
-                line.resize(cols, blank);
-            }
-        }
         self.cells = next;
+        self.row_wrapped.resize(rows, false);
         self.cols = cols;
         self.rows = rows;
         self.cx = self.cx.min(cols - 1);
         self.cy = self.cy.min(rows - 1);
         self.wrap_pending = false;
-        self.dirty = true;
+    }
+
+    /// Reflow the whole buffer: join soft-wrapped lines into logical lines,
+    /// re-wrap them at the new width, and split the chunks back into
+    /// history + visible grid.
+    fn reflow(&mut self, cols: usize, rows: usize) {
+        let blank = Cell::blank(self.default_fg, self.default_bg);
+        let (old_cols, old_rows) = (self.cols, self.rows);
+        let mut logicals: Vec<Vec<Cell>> = Vec::new();
+        let mut open = false;
+        for line in self.scrollback.drain(..) {
+            append_logical(&mut logicals, line.cells, open, line.wrapped, &blank);
+            open = line.wrapped;
+        }
+        for y in 0..old_rows {
+            let cells = self.cells[y * old_cols..(y + 1) * old_cols].to_vec();
+            let wrapped = self.row_wrapped[y];
+            append_logical(&mut logicals, cells, open, wrapped, &blank);
+            open = wrapped;
+        }
+        self.rebuild(logicals, cols, rows);
+    }
+
+    /// Same as [`Self::reflow`], but the visible-grid lines come from a saved
+    /// (primary) screen instead of the live one. Used when the window was
+    /// resized while an alternate screen was up.
+    fn reflow_saved(&mut self, saved: SavedScreen, cols: usize, rows: usize) {
+        let blank = Cell::blank(self.default_fg, self.default_bg);
+        let mut logicals: Vec<Vec<Cell>> = Vec::new();
+        let mut open = false;
+        for line in self.scrollback.drain(..) {
+            append_logical(&mut logicals, line.cells, open, line.wrapped, &blank);
+            open = line.wrapped;
+        }
+        for y in 0..saved.rows {
+            let cells = saved.cells[y * saved.cols..(y + 1) * saved.cols].to_vec();
+            let wrapped = saved.row_wrapped.get(y).copied().unwrap_or(false);
+            append_logical(&mut logicals, cells, open, wrapped, &blank);
+            open = wrapped;
+        }
+        self.rebuild(logicals, cols, rows);
+        // The saved cursor pointed into the old geometry; clamp it.
+        self.cx = saved.cx.min(cols - 1);
+        self.cy = saved.cy.min(rows - 1);
+    }
+
+    /// Split logical lines into fixed-width chunks and rebuild history and
+    /// the visible grid from them.
+    fn rebuild(&mut self, logicals: Vec<Vec<Cell>>, cols: usize, rows: usize) {
+        let blank = Cell::blank(self.default_fg, self.default_bg);
+        let mut chunks: Vec<Vec<Cell>> = Vec::new();
+        let mut flags: Vec<bool> = Vec::new();
+        for logical in logicals {
+            let base = chunks.len();
+            let mut i = 0;
+            while i < logical.len() {
+                // Drop orphan continuation cells at a chunk start.
+                while i < logical.len() && logical[i].ch == '\0' {
+                    i += 1;
+                }
+                if i >= logical.len() {
+                    break;
+                }
+                let end = (i + cols).min(logical.len());
+                // Never cut between a wide glyph and its continuation cell.
+                let cut = if end < logical.len() && logical[end].ch == '\0' {
+                    end - 1
+                } else {
+                    end
+                };
+                let mut chunk = logical[i..cut.max(i)].to_vec();
+                chunk.resize(cols, blank);
+                let more = cut < logical.len();
+                chunks.push(chunk);
+                flags.push(more);
+                i = if cut == i && more { end } else { cut };
+            }
+            if chunks.len() == base {
+                // Empty logical line: keep it as a blank row.
+                chunks.push(vec![blank; cols]);
+                flags.push(false);
+            }
+        }
+
+        // The last `rows` chunks become the visible grid, the rest goes to
+        // history (dropping the oldest first when over the limit). Content
+        // sits against the bottom of the grid when there are fewer chunks
+        // than rows, keeping it near the cursor.
+        let total = chunks.len();
+        let visible = total.min(rows);
+        let visible_start = total - visible;
+        let history_start = visible_start.saturating_sub(self.scrollback_limit);
+        let mut history = VecDeque::new();
+        let mut grid: Vec<(Vec<Cell>, bool)> = Vec::new();
+        for (index, (cells, wrapped)) in chunks.into_iter().zip(flags).enumerate() {
+            if index < history_start {
+                continue;
+            } else if index < visible_start {
+                history.push_back(HistLine { cells, wrapped });
+            } else {
+                grid.push((cells, wrapped));
+            }
+        }
+        self.scrollback = history;
+        self.cells = vec![blank; cols * rows];
+        self.row_wrapped = vec![false; rows];
+        let first_row = rows - grid.len();
+        for (offset, (cells, wrapped)) in grid.into_iter().enumerate() {
+            let y = first_row + offset;
+            self.cells[y * cols..(y + 1) * cols].copy_from_slice(&cells);
+            self.row_wrapped[y] = wrapped;
+        }
+        self.cols = cols;
+        self.rows = rows;
+        self.cx = self.cx.min(cols - 1);
+        self.cy = self.cy.min(rows - 1);
+        self.wrap_pending = false;
     }
 
     fn idx(&self, x: usize, y: usize) -> usize {
@@ -358,6 +494,9 @@ impl Term {
             }
         }
         self.cells.copy_within(n * self.cols.., 0);
+        // Wrap flags belong to the rows, so they shift with them.
+        self.row_wrapped.copy_within(n.., 0);
+        self.row_wrapped[self.rows - n..].fill(false);
         let blank = self.blank();
         for c in self.cells[(self.rows - n) * self.cols..].iter_mut() {
             *c = blank;
@@ -369,8 +508,10 @@ impl Term {
             self.scrollback.pop_front();
         }
         let start = row * self.cols;
-        self.scrollback
-            .push_back(self.cells[start..start + self.cols].to_vec());
+        self.scrollback.push_back(HistLine {
+            cells: self.cells[start..start + self.cols].to_vec(),
+            wrapped: self.row_wrapped[row],
+        });
     }
 
     fn scroll_down(&mut self, count: usize) {
@@ -380,6 +521,8 @@ impl Term {
         }
         self.cells
             .copy_within(..(self.rows - n) * self.cols, n * self.cols);
+        self.row_wrapped.copy_within(..self.rows - n, n);
+        self.row_wrapped[..n].fill(false);
         let blank = self.blank();
         for c in self.cells[..n * self.cols].iter_mut() {
             *c = blank;
@@ -409,9 +552,14 @@ impl Term {
             return;
         }
         if self.wrap_pending || self.cx + width > self.cols {
+            // The row being left is soft-wrapped: remember it so a later
+            // resize can join the fragments back into one logical line.
+            self.row_wrapped[self.cy] = true;
             self.cx = 0;
             self.linefeed();
         }
+        // Any non-wrapping write starts fresh content on this row.
+        self.row_wrapped[self.cy] = false;
         // SGR 7 swaps the pen colors for the duration of the attribute.
         let (fg, bg) = if self.inverse {
             (self.bg, self.fg)
@@ -516,26 +664,66 @@ impl Term {
                     if self.saved.is_none() {
                         self.saved = Some(SavedScreen {
                             cells: self.cells.clone(),
+                            row_wrapped: self.row_wrapped.clone(),
                             cx: self.cx,
                             cy: self.cy,
+                            cols: self.cols,
+                            rows: self.rows,
                         });
                     }
                     if mode == 1049 || mode == 1047 {
                         let blank = self.blank();
                         self.cells.iter_mut().for_each(|c| *c = blank);
+                        self.row_wrapped.iter_mut().for_each(|f| *f = false);
                         self.cx = 0;
                         self.cy = 0;
                     }
                 } else if let Some(s) = self.saved.take() {
-                    self.cells = s.cells;
-                    self.cx = s.cx.min(self.cols - 1);
-                    self.cy = s.cy.min(self.rows - 1);
+                    if s.cols == self.cols && s.rows == self.rows {
+                        self.cells = s.cells;
+                        self.row_wrapped = s.row_wrapped;
+                        self.cx = s.cx.min(self.cols - 1);
+                        self.cy = s.cy.min(self.rows - 1);
+                    } else {
+                        // Resized while the alternate screen was up: reflow
+                        // the saved primary screen into the new geometry.
+                        self.reflow_saved(s, self.cols, self.rows);
+                    }
                 }
                 self.dirty = true;
             }
             _ => {}
         }
     }
+}
+
+/// Append one source line to the logical-line list. `attach` (the previous
+/// line's wrap flag) joins this line onto the open logical line; `wrapped`
+/// (this line's own flag) keeps its trailing blanks, because a soft-wrapped
+/// row is full-width and its trailing spaces are real content. Hard-ended
+/// lines have their trailing blanks dropped; the re-wrap pads chunks again.
+fn append_logical(
+    logicals: &mut Vec<Vec<Cell>>,
+    cells: Vec<Cell>,
+    attach: bool,
+    wrapped: bool,
+    blank: &Cell,
+) {
+    let end = if wrapped {
+        cells.len()
+    } else {
+        cells
+            .iter()
+            .rposition(|cell| *cell != *blank)
+            .map_or(0, |i| i + 1)
+    };
+    if attach {
+        if let Some(last) = logicals.last_mut() {
+            last.extend_from_slice(&cells[..end]);
+            return;
+        }
+    }
+    logicals.push(cells[..end].to_vec());
 }
 
 fn xterm_256(n: u16, palette: &[[u8; 3]; 16]) -> [u8; 3] {
@@ -730,6 +918,7 @@ impl Perform for Term {
                 self.focus_reporting = false;
                 self.clipboard_writes.clear();
                 self.clipboard_query = false;
+                self.row_wrapped.iter_mut().for_each(|f| *f = false);
                 self.reset_pen();
             }
             b'D' => self.linefeed(),
@@ -875,10 +1064,12 @@ mod tests {
     }
 
     /// Text of an absolute line (scrollback followed by the visible grid).
+    /// Wide-glyph continuation cells (`'\0'`) are skipped.
     fn line_text(t: &Term, index: usize) -> String {
         t.line(index)
             .map(|line| {
                 line.iter()
+                    .filter(|c| c.ch != '\0')
                     .map(|c| c.ch)
                     .collect::<String>()
                     .trim_end()
@@ -946,14 +1137,74 @@ mod tests {
     fn scrollback_survives_resize() {
         let mut t = Term::new(4, 2);
         feed(&mut t, "abcdef\r\ngh\r\nij\r\nkl");
-        let before = t.scrollback_len();
-        assert!(before > 0);
         t.resize(8, 3);
-        assert_eq!(t.scrollback_len(), before);
-        // Every history line must match the new width.
-        for i in 0..t.scrollback_len() {
-            assert_eq!(t.line(i).unwrap().len(), 8);
-        }
+        // Reflow joins the soft-wrapped fragments ("ab"/"cd"→"abcd"+"ef") and
+        // keeps every character, in order, across history + visible grid.
+        let joined: Vec<String> = (0..t.total_lines()).map(|i| line_text(&t, i)).collect();
+        assert_eq!(joined, vec!["abcdef", "gh", "ij", "kl"]);
+    }
+
+    #[test]
+    fn resize_joins_soft_wrapped_fragments() {
+        // "hello world" soft-wraps at width 6 into "hello" + " world".
+        let mut t = Term::new(6, 3);
+        feed(&mut t, "hello world");
+        assert_eq!(line_text(&t, 0), "hello");
+        assert_eq!(line_text(&t, 1), "world");
+        t.resize(11, 3);
+        // One logical line again. The old trailing blank row reflows after
+        // it, so the content sits on row 1.
+        assert_eq!(line_text(&t, 1), "hello world");
+        assert_eq!(line_text(&t, 2), "");
+    }
+
+    #[test]
+    fn resize_rewraps_long_lines_into_scrollback() {
+        let mut t = Term::new(20, 2);
+        feed(&mut t, "one\r\n");
+        feed(&mut t, "hello world");
+        t.resize(6, 2);
+        // "hello world" splits into two 6-column chunks; the first is pushed
+        // into history, the second stays on the grid.
+        assert_eq!(t.scrollback_len(), 1);
+        assert_eq!(line_text(&t, 0), "one");
+        assert_eq!(line_text(&t, 1), "hello");
+        assert_eq!(line_text(&t, 2), "world");
+        // And widening again re-joins them; everything fits on the grid now.
+        t.resize(11, 2);
+        assert_eq!(t.scrollback_len(), 0);
+        assert_eq!(line_text(&t, 0), "one");
+        assert_eq!(line_text(&t, 1), "hello world");
+    }
+
+    #[test]
+    fn reflow_never_splits_wide_glyphs() {
+        // 日本 is two cells wide; at cols=4 the line "ab日本x" wraps so that
+        // both glyphs land whole after any resize.
+        let mut t = Term::new(4, 3);
+        feed(&mut t, "ab日本x");
+        assert_eq!(line_text(&t, 0), "ab日");
+        assert_eq!(line_text(&t, 1), "本x");
+        t.resize(5, 3);
+        // The logical line "ab日本x" (7 cells) re-wraps at 5 columns, cutting
+        // before 本's right half so the glyph stays whole; the old trailing
+        // blank row reflows after the content.
+        assert_eq!(line_text(&t, 0), "ab日");
+        assert_eq!(line_text(&t, 1), "本x");
+    }
+
+    #[test]
+    fn alt_screen_resize_then_exit_reflows_primary() {
+        let mut t = Term::new(4, 2);
+        feed(&mut t, "keep\r\nit");
+        feed(&mut t, "\x1b[?1049h");
+        // Resize while the alternate screen is up, then leave it.
+        t.resize(8, 2);
+        feed(&mut t, "\x1b[?1049l");
+        // "keep" + "it" were one prompt block... they were hard-broken, so
+        // they stay two lines, re-wrapped onto the 8-column grid.
+        assert_eq!(line_text(&t, 0), "keep");
+        assert_eq!(line_text(&t, 1), "it");
     }
 
     #[test]
