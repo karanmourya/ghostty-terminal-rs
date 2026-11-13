@@ -92,9 +92,15 @@ implemented: `?1000` (clicks), `?1002` (drag), `?1003` (any motion).
 Drag with the left button to select, double-click for a word, triple-click for
 a whole line. The selection is
 highlighted behind the text, stays attached to its lines while you scroll, and
-is copied to the clipboard when you release the mouse. Ctrl+Shift+C copies it
-again; typing or clicking elsewhere clears it. When an application has enabled
-mouse reporting, hold **Shift** to select instead of forwarding the drag.
+is copied to the clipboard when you release the mouse. **Ctrl+Shift+C** copies
+the selection, **Ctrl+Shift+A** copies the full scrollback + screen; typing or
+clicking elsewhere clears it. When an application has enabled mouse reporting,
+hold **Shift** to select instead of forwarding the drag.
+
+**Ctrl+Shift+F** opens scrollback search (case-insensitive): type to filter,
+**Enter** / **Shift+Enter** jump to the next/previous match (the viewport
+follows), **Esc** closes. The current match is highlighted and status is shown
+in the window title.
 
 Drag past the top or bottom edge of the window and the viewport auto-scrolls
 through history (and back down) until you release.
@@ -108,8 +114,7 @@ with `clipboard-write = false` / `clipboard-read = false` in the config file.
 ## What is missing (the honest list)
 
 - Tabs, splits, multiple windows.
-- (OSC 7 cwd is parsed and stored; no UI surface yet.)
-- Search in scrollback. (Full buffer can be copied with **Ctrl+Shift+A**.)
+- OSC 7 cwd is parsed/stored but not surfaced in the UI.
 - Server/daemon mode, shell integration, notifications, kitty graphics protocol.
 
 ## Architecture

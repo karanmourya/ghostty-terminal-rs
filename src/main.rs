@@ -27,6 +27,14 @@ use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer as GlyphonRenderer, Viewport, Weight,
 };
+
+#[derive(Clone, Debug, Default)]
+struct SearchState {
+    query: String,
+    /// (absolute line, start column in cells, query length in chars).
+    matches: Vec<(usize, usize, usize)>,
+    current: usize,
+}
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -71,6 +79,54 @@ impl Selection {
             (self.anchor, self.head)
         } else {
             (self.head, self.anchor)
+        }
+    }
+}
+
+/// Highlight colour for the current search match.
+const SEARCH_BG: [u8; 3] = [0xd7, 0x8f, 0x2a];
+
+impl SearchState {
+    fn recompute(&mut self, term: &Term) {
+        self.matches.clear();
+        let query = self.query.to_lowercase();
+        if query.is_empty() {
+            self.current = 0;
+            return;
+        }
+        let qlen = query.chars().count().max(1);
+        for line in 0..term.total_lines() {
+            let Some(cells) = term.line(line) else {
+                continue;
+            };
+            let mut text = String::new();
+            let mut cols: Vec<usize> = Vec::new();
+            for (x, cell) in cells.iter().enumerate() {
+                if cell.ch == '\0' {
+                    continue;
+                }
+                for ch in cell.ch.to_lowercase() {
+                    text.push(ch);
+                    cols.push(x);
+                }
+            }
+            let mut start = 0;
+            while let Some(rel) = text[start..].find(&query) {
+                let idx = start + rel;
+                let col = cols.get(idx).copied().unwrap_or(0);
+                self.matches.push((line, col, qlen));
+                let next = text[idx..]
+                    .chars()
+                    .next()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(1);
+                start = idx + next;
+            }
+        }
+        if self.matches.is_empty() {
+            self.current = 0;
+        } else {
+            self.current = self.current.min(self.matches.len() - 1);
         }
     }
 }
@@ -417,6 +473,8 @@ struct App {
     click_count: u32,
     /// Whether the pointer is over an OSC 8 hyperlink (pointer cursor shown).
     over_link: bool,
+    /// Scrollback search mode (Ctrl+Shift+F).
+    search: Option<SearchState>,
 
     modifiers: ModifiersState,
     width: u32,
@@ -462,11 +520,134 @@ impl App {
             last_click: None,
             click_count: 0,
             over_link: false,
+            search: None,
             modifiers: ModifiersState::empty(),
             width: 1000,
             height: 640,
             scale: 1.0,
         }
+    }
+
+    // -- search -------------------------------------------------------------
+
+    fn search_open(&mut self) {
+        self.search = Some(SearchState::default());
+        self.sync_search_title();
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+
+    fn search_close(&mut self) {
+        if self.search.take().is_some() {
+            self.sync_window_title();
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
+        }
+    }
+
+    fn sync_search_title(&self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        if let Some(s) = &self.search {
+            if s.query.is_empty() {
+                window.set_title("Search: (type to find, Esc to close)");
+            } else if s.matches.is_empty() {
+                window.set_title(&format!("Search: {} — no matches", s.query));
+            } else {
+                window.set_title(&format!(
+                    "Search: {} — {}/{} (Enter next, Shift+Enter prev, Esc close)",
+                    s.query,
+                    s.current + 1,
+                    s.matches.len()
+                ));
+            }
+        }
+    }
+
+    fn sync_window_title(&self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        if let Some(title) = self.term.title.clone() {
+            window.set_title(&format!("{title} - Ghostty (Rust)"));
+        } else {
+            window.set_title("Ghostty (Rust) - Windows");
+        }
+    }
+
+    fn search_input(&mut self, ch: char) {
+        if let Some(s) = self.search.as_mut() {
+            s.query.push(ch);
+            s.current = 0;
+            s.recompute(&self.term);
+            self.search_jump_to_current();
+            self.sync_search_title();
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
+        }
+    }
+
+    fn search_backspace(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            s.query.pop();
+            s.current = 0;
+            s.recompute(&self.term);
+            self.search_jump_to_current();
+            self.sync_search_title();
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
+        }
+    }
+
+    fn search_next(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            if s.matches.is_empty() {
+                self.sync_search_title();
+                return;
+            }
+            s.current = (s.current + 1) % s.matches.len();
+            self.search_jump_to_current();
+            self.sync_search_title();
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
+        }
+    }
+
+    fn search_prev(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            if s.matches.is_empty() {
+                self.sync_search_title();
+                return;
+            }
+            s.current = if s.current == 0 {
+                s.matches.len() - 1
+            } else {
+                s.current - 1
+            };
+            self.search_jump_to_current();
+            self.sync_search_title();
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
+        }
+    }
+
+    fn search_jump_to_current(&mut self) {
+        let Some(s) = self.search.as_ref() else {
+            return;
+        };
+        let Some(&(line, _, _)) = s.matches.get(s.current) else {
+            return;
+        };
+        let history = self.term.scrollback_len();
+        let top = line.saturating_sub(self.term.rows / 2);
+        self.set_scroll(history.saturating_sub(top.min(history)));
     }
 
     // -- terminal geometry --------------------------------------------------
@@ -879,10 +1060,8 @@ impl App {
                 text.dirty = true;
                 window.request_redraw();
             }
-            if let Some(title) = self.term.title.clone() {
-                if let Some(window) = self.window.as_ref() {
-                    window.set_title(&format!("{title} - Ghostty (Rust)"));
-                }
+            if self.search.is_none() {
+                self.sync_window_title();
             }
         }
     }
@@ -1044,6 +1223,27 @@ impl App {
                         ],
                         color: linear(cell.fg, 1.0),
                     });
+                }
+            }
+        }
+        // --- search match highlight ---
+        if let Some(search) = &self.search {
+            if let Some(&(mline, mcol, mlen)) = search.matches.get(search.current) {
+                if mline >= top && mline < top + rows {
+                    let y = mline - top;
+                    let first = mcol.min(cols.saturating_sub(1));
+                    let last = (mcol + mlen).saturating_sub(1).min(cols.saturating_sub(1));
+                    if first <= last {
+                        instances.push(Quad {
+                            rect: [
+                                padding + first as f32 * cell_w,
+                                padding + y as f32 * line_h,
+                                (last - first + 1) as f32 * cell_w,
+                                line_h,
+                            ],
+                            color: linear(SEARCH_BG, 0.55),
+                        });
+                    }
                 }
             }
         }
@@ -1335,6 +1535,32 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
+                // Search mode intercepts typing/navigation until closed.
+                if self.search.is_some() {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Escape) => self.search_close(),
+                        Key::Named(NamedKey::Backspace) => self.search_backspace(),
+                        Key::Named(NamedKey::Enter) => {
+                            if self.modifiers.shift_key() {
+                                self.search_prev();
+                            } else {
+                                self.search_next();
+                            }
+                        }
+                        Key::Character(text)
+                            if !self.modifiers.control_key() && !self.modifiers.alt_key() =>
+                        {
+                            for ch in text.chars() {
+                                if !ch.is_control() {
+                                    self.search_input(ch);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+
                 // Shift+PageUp/PageDown/Home/End drive the scrollback viewport
                 // instead of being forwarded to the application.
                 if self.modifiers.shift_key() && !self.modifiers.control_key() {
@@ -1361,7 +1587,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
-                // Ctrl+Shift+C copies the selection, Ctrl+Shift+A copies all.
+                // Ctrl+Shift+C copies selection, A copies all, F toggles search.
                 if self.modifiers.control_key() && self.modifiers.shift_key() {
                     if let Key::Character(text) = &event.logical_key {
                         if text.eq_ignore_ascii_case("c") {
@@ -1370,6 +1596,14 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         if text.eq_ignore_ascii_case("a") {
                             self.copy_all();
+                            return;
+                        }
+                        if text.eq_ignore_ascii_case("f") {
+                            if self.search.is_some() {
+                                self.search_close();
+                            } else {
+                                self.search_open();
+                            }
                             return;
                         }
                     }
