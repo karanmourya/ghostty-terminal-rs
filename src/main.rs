@@ -37,7 +37,7 @@ use winit::{
     event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{Key, ModifiersState, NamedKey},
-    window::{Window, WindowId},
+    window::{CursorIcon, Window, WindowId},
 };
 
 use quad::{linear, Quad, QuadRenderer};
@@ -368,6 +368,8 @@ struct App {
     last_click: Option<(std::time::Instant, (usize, usize))>,
     /// Consecutive fast clicks on the same cell: 1 char, 2 word, 3+ line.
     click_count: u32,
+    /// Whether the pointer is over an OSC 8 hyperlink (pointer cursor shown).
+    over_link: bool,
 
     modifiers: ModifiersState,
     width: u32,
@@ -412,6 +414,7 @@ impl App {
             selecting: false,
             last_click: None,
             click_count: 0,
+            over_link: false,
             modifiers: ModifiersState::empty(),
             width: 1000,
             height: 640,
@@ -680,6 +683,23 @@ impl App {
         if let Some(text) = self.selection_text() {
             set_clipboard(&text);
         }
+    }
+
+    /// Ctrl+click on an OSC 8 hyperlink. Only http(s) URLs are launched, so
+    /// terminal output cannot invoke arbitrary protocol handlers.
+    fn open_link_at(&self, cell: (usize, usize)) -> bool {
+        let (line, col) = self.absolute_cell(cell);
+        let Some(url) = self.term.link_at(line, col) else {
+            return false;
+        };
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return false;
+        }
+        // rundll32 takes the URL as a plain argument: no shell parsing.
+        let _ = std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
+            .spawn();
+        true
     }
 
     // -- PTY ---------------------------------------------------------------
@@ -1355,6 +1375,19 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 self.pointer_cell = cell;
+                // OSC 8: a pointer cursor over hyperlinks is the only cue.
+                let (line, col) = self.absolute_cell(cell);
+                let over_link = self.term.link_at(line, col).is_some();
+                if over_link != self.over_link {
+                    self.over_link = over_link;
+                    if let Some(window) = self.window.as_ref() {
+                        window.set_cursor(if over_link {
+                            CursorIcon::Pointer
+                        } else {
+                            CursorIcon::Default
+                        });
+                    }
+                }
                 if self.selecting {
                     // Use the signed row so dragging past an edge clamps the
                     // head to the buffer instead of sticking to the last cell.
@@ -1374,6 +1407,13 @@ impl ApplicationHandler<UserEvent> for App {
                 match state {
                     ElementState::Pressed => {
                         self.mouse_down = Some(code);
+                        // Ctrl+click opens an OSC 8 hyperlink.
+                        if button == MouseButton::Left
+                            && self.modifiers.control_key()
+                            && self.open_link_at(self.pointer_cell)
+                        {
+                            return;
+                        }
                         if reports {
                             // A click while scrolled back means "back to live".
                             self.jump_to_bottom();

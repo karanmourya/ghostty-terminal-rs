@@ -37,6 +37,7 @@ cargo run --release       # optimised
 | OSC 52 clipboard (write, `?` read-query; gated by `clipboard-write`/`clipboard-read`) | ✅ |
 | Synchronized output (`?2026`) with a 2 s stuck-sync safety valve | ✅ |
 | Scroll regions (`DECSTBM`); region scrolls never pollute history | ✅ |
+| OSC 8 hyperlinks — pointer cursor on hover, Ctrl+click opens http(s) | ✅ |
 | Scrollback (10 000 lines) + mouse wheel, Shift+PgUp/PgDn/Home/End | ✅ (overlay scrollbar) |
 | **Resize reflow** — soft-wrapped lines are joined and re-wrapped on resize | ✅ (wide glyphs never split) |
 | DPI scaling | ✅ |
@@ -57,6 +58,13 @@ The primary screen keeps up to 10 000 scrolled-off lines. The alternate screen
 
 While scrolled back, a thin overlay scrollbar appears on the right and the
 viewport stays anchored if new output arrives.
+
+## Hyperlinks
+
+Apps that emit OSC 8 hyperlinks (most modern CLIs, `grep --hyperlink`, cargo
+diagnostics) get a pointer cursor over their links. **Ctrl+click** opens one in
+the default browser. Only `http://` and `https://` URLs are launched, so
+terminal output cannot trigger arbitrary protocol handlers.
 
 ## Resize reflow
 
@@ -100,7 +108,7 @@ with `clipboard-write = false` / `clipboard-read = false` in the config file.
 ## What is missing (the honest list)
 
 - Tabs, splits, multiple windows.
-- OSC 8 hyperlinks, OSC 7 cwd.
+- OSC 7 cwd.
 - Search, scrollback export.
 - Tab stops beyond every 8 columns.
 - Server/daemon mode, shell integration, notifications, kitty graphics protocol.

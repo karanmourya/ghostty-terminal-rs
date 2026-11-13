@@ -46,6 +46,8 @@ pub struct Cell {
     pub bg: [u8; 3],
     pub bold: bool,
     pub underline: bool,
+    /// OSC 8 hyperlink id (0 = none), indexing the terminal's link table.
+    pub link: u16,
 }
 
 impl Default for Cell {
@@ -56,6 +58,7 @@ impl Default for Cell {
             bg: DEFAULT_BG,
             bold: false,
             underline: false,
+            link: 0,
         }
     }
 }
@@ -68,6 +71,7 @@ impl Cell {
             bg,
             bold: false,
             underline: false,
+            link: 0,
         }
     }
 }
@@ -156,6 +160,10 @@ pub struct Term {
     /// Synchronized output (`?2026`): repaints are held until cleared.
     pub sync_output: bool,
     sync_started: Option<std::time::Instant>,
+    /// OSC 8 hyperlink table; cell ids are 1-based indexes into it.
+    links: Vec<String>,
+    /// Hyperlink attached to newly written cells (0 = none).
+    current_link: u16,
     responses: Vec<Vec<u8>>,
     dirty: bool,
 }
@@ -201,6 +209,8 @@ impl Term {
             osc52_read: true,
             sync_output: false,
             sync_started: None,
+            links: Vec::new(),
+            current_link: 0,
             responses: Vec::new(),
             dirty: true,
         }
@@ -308,6 +318,18 @@ impl Term {
     #[allow(dead_code)]
     pub fn cell(&self, x: usize, y: usize) -> &Cell {
         &self.cells[y * self.cols + x]
+    }
+
+    pub fn link_url(&self, id: u16) -> Option<&str> {
+        id.checked_sub(1)
+            .and_then(|i| self.links.get(usize::from(i)))
+            .map(String::as_str)
+    }
+
+    /// Hyperlink URL stored on an absolute line/column, if any.
+    pub fn link_at(&self, line: usize, col: usize) -> Option<&str> {
+        let cell = self.line(line)?.get(col)?;
+        self.link_url(cell.link)
     }
 
     pub fn cursor(&self) -> (usize, usize) {
@@ -617,6 +639,7 @@ impl Term {
             bg,
             bold: self.bold,
             underline: self.underline,
+            link: self.current_link,
         };
         // Wide characters occupy a continuation cell that the renderer skips.
         if width == 2 && self.cx + 1 < self.cols {
@@ -627,6 +650,7 @@ impl Term {
                 bg,
                 bold: self.bold,
                 underline: self.underline,
+                link: self.current_link,
             };
         }
         let next = self.cx + width;
@@ -986,6 +1010,8 @@ impl Perform for Term {
                 self.row_wrapped.iter_mut().for_each(|f| *f = false);
                 self.sync_output = false;
                 self.sync_started = None;
+                self.links.clear();
+                self.current_link = 0;
                 self.scroll_top = 0;
                 self.scroll_bottom = self.rows - 1;
                 self.reset_pen();
@@ -1043,7 +1069,22 @@ impl Perform for Term {
                 }
             }
         }
-        // TODO: OSC 8 hyperlinks, OSC 7 cwd.
+        // OSC 8: hyperlinks. `params` is ["8", params, uri]; an empty URI
+        // closes the link. shortcut: the link table is never trimmed and
+        // caps at u16::MAX entries, plenty for any session.
+        if params.first().is_some_and(|p| *p == b"8") {
+            let uri = params
+                .get(2..)
+                .map(|rest| rest.join(&b';'))
+                .unwrap_or_default();
+            self.current_link = if uri.is_empty() || self.links.len() >= usize::from(u16::MAX) {
+                0
+            } else {
+                self.links.push(String::from_utf8_lossy(&uri).into_owned());
+                self.links.len() as u16
+            };
+        }
+        // TODO: OSC 7 cwd.
     }
 }
 
@@ -1392,6 +1433,31 @@ mod tests {
         // Empty selection field also means the system clipboard.
         feed(&mut t, "\x1b]52;;d29ybGQ=\x07");
         assert_eq!(t.take_clipboard_writes(), vec!["world".to_string()]);
+    }
+
+    #[test]
+    fn osc8_hyperlinks_attach_to_cells() {
+        let mut t = Term::new(20, 2);
+        feed(
+            &mut t,
+            "\x1b]8;;https://example.com/a;b\x1b\\link\x1b]8;;\x1b\\ plain",
+        );
+        assert_eq!(t.link_at(0, 0), Some("https://example.com/a;b"));
+        assert_eq!(t.link_at(0, 3), Some("https://example.com/a;b"));
+        // The closing OSC ends the link; the following cells have none.
+        assert_eq!(t.link_at(0, 4), None);
+        assert_eq!(t.link_at(0, 9), None);
+        // Out-of-range lookups stay quiet instead of panicking.
+        assert_eq!(t.link_at(0, 500), None);
+        assert_eq!(t.link_at(99, 0), None);
+
+        // A wide glyph's continuation cell carries the same link.
+        feed(
+            &mut t,
+            "\x1b[2;1H\x1b]8;;https://x.test\x07日\x1b]8;;\x1b\\",
+        );
+        assert_eq!(t.link_at(1, 0), Some("https://x.test"));
+        assert_eq!(t.link_at(1, 1), Some("https://x.test"));
     }
 
     #[test]
