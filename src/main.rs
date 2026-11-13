@@ -586,14 +586,20 @@ impl App {
         let Some(window) = self.window.as_ref() else {
             return;
         };
+        let total = self.inactive_tabs.len() + 1;
+        let prefix = if total > 1 {
+            format!("[{}/{}] ", self.active_tab + 1, total)
+        } else {
+            String::new()
+        };
         if let Some(s) = &self.search {
             if s.query.is_empty() {
-                window.set_title("Search: (type to find, Esc to close)");
+                window.set_title(&format!("{prefix}Search: (type to find, Esc to close)"));
             } else if s.matches.is_empty() {
-                window.set_title(&format!("Search: {} — no matches", s.query));
+                window.set_title(&format!("{prefix}Search: {} — no matches", s.query));
             } else {
                 window.set_title(&format!(
-                    "Search: {} — {}/{} (Enter next, Shift+Enter prev, Esc close)",
+                    "{prefix}Search: {} — {}/{} (Enter next, Shift+Enter prev, Esc close)",
                     s.query,
                     s.current + 1,
                     s.matches.len()
@@ -606,8 +612,14 @@ impl App {
         let Some(window) = self.window.as_ref() else {
             return;
         };
+        let total = self.inactive_tabs.len() + 1;
+        let prefix = if total > 1 {
+            format!("[{}/{}] ", self.active_tab + 1, total)
+        } else {
+            String::new()
+        };
         if let Some(title) = self.term.title.clone() {
-            window.set_title(&format!("{title} - Ghostty (Rust)"));
+            window.set_title(&format!("{prefix}{title} - Ghostty (Rust)"));
         } else if let Some(cwd) = self.term.cwd.as_deref() {
             let name = cwd
                 .trim_end_matches(['/', '\\'])
@@ -615,7 +627,9 @@ impl App {
                 .next()
                 .filter(|s| !s.is_empty())
                 .unwrap_or(cwd);
-            window.set_title(&format!("{name} - Ghostty (Rust)"));
+            window.set_title(&format!("{prefix}{name} - Ghostty (Rust)"));
+        } else if total > 1 {
+            window.set_title(&format!("{prefix}Ghostty (Rust) - Windows"));
         } else {
             window.set_title("Ghostty (Rust) - Windows");
         }
@@ -1029,8 +1043,11 @@ impl App {
 
     fn fresh_tab(&mut self) {
         self.term = Term::new(self.term.cols.max(80), self.term.rows.max(24));
-        self.term
-            .set_theme(self.config.foreground, self.config.background, self.config.palette);
+        self.term.set_theme(
+            self.config.foreground,
+            self.config.background,
+            self.config.palette,
+        );
         self.term.set_scrollback_limit(self.config.scrollback);
         self.term.osc52_write = self.config.clipboard_write;
         self.term.osc52_read = self.config.clipboard_read;
@@ -1105,7 +1122,9 @@ impl App {
         self.pty_writer = None;
         self.pty_master = None;
         self.rx = None;
-        let idx = self.active_tab.min(self.inactive_tabs.len().saturating_sub(1));
+        let idx = self
+            .active_tab
+            .min(self.inactive_tabs.len().saturating_sub(1));
         let tab = self.inactive_tabs.remove(idx);
         self.active_tab = idx.min(self.inactive_tabs.len());
         self.restore_tab(tab);
