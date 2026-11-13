@@ -108,7 +108,7 @@ with `clipboard-write = false` / `clipboard-read = false` in the config file.
 ## What is missing (the honest list)
 
 - Tabs, splits, multiple windows.
-- OSC 7 cwd.
+- (OSC 7 cwd is parsed and stored; no UI surface yet.)
 - Search in scrollback. (Full buffer can be copied with **Ctrl+Shift+A**.)
 - Server/daemon mode, shell integration, notifications, kitty graphics protocol.
 

@@ -152,6 +152,8 @@ pub struct Term {
     /// Focus in/out reporting (`?1004`).
     pub focus_reporting: bool,
     pub title: Option<String>,
+    /// Current working directory reported via OSC 7, if any.
+    pub cwd: Option<String>,
     /// Texts queued by OSC 52 for the app to put on the clipboard.
     clipboard_writes: Vec<String>,
     /// Set when an app queries the clipboard with OSC 52 `?`.
@@ -206,6 +208,7 @@ impl Term {
             mouse_sgr: false,
             focus_reporting: false,
             title: None,
+            cwd: None,
             clipboard_writes: Vec::new(),
             clipboard_query: false,
             osc52_write: true,
@@ -1062,6 +1065,8 @@ impl Perform for Term {
                 self.scroll_top = 0;
                 self.scroll_bottom = self.rows - 1;
                 self.reset_tab_stops();
+                self.title = None;
+                self.cwd = None;
                 self.reset_pen();
             }
             b'D' => self.linefeed(),
@@ -1138,7 +1143,30 @@ impl Perform for Term {
                 self.links.len() as u16
             };
         }
-        // TODO: OSC 7 cwd.
+        // OSC 7: current working directory, typically `file://host/path`.
+        if params.first().is_some_and(|p| *p == b"7") {
+            if let Some(uri) = params.get(1) {
+                let uri = String::from_utf8_lossy(uri);
+                self.cwd = Some(parse_osc7_path(&uri));
+            }
+        }
+    }
+}
+
+fn parse_osc7_path(uri: &str) -> String {
+    let rest = uri.strip_prefix("file://").unwrap_or(uri);
+    // Skip the hostname (possibly empty, as in file:///C:/...) to reach the path.
+    let path = match rest.find('/') {
+        Some(i) => &rest[i + 1..],
+        None => rest,
+    };
+    if path.len() >= 2 && path.as_bytes()[1] == b':' {
+        // Windows drive path reported as /C:/... or C:/...
+        path.to_string()
+    } else if uri.starts_with("file://") {
+        format!("/{path}")
+    } else {
+        path.to_string()
     }
 }
 
@@ -1629,6 +1657,15 @@ mod tests {
         assert_eq!(t.cursor().0, 16);
         feed(&mut t, "\r\x1b[3g\t");
         assert_eq!(t.cursor().0, 39);
+    }
+
+    #[test]
+    fn osc7_reports_cwd() {
+        let mut t = Term::new(40, 2);
+        feed(&mut t, "\x1b]7;file://host/home/user/project\x07");
+        assert_eq!(t.cwd.as_deref(), Some("/home/user/project"));
+        feed(&mut t, "\x1b]7;file:///C:/Users/dev\x07");
+        assert_eq!(t.cwd.as_deref(), Some("C:/Users/dev"));
     }
 
     #[test]
