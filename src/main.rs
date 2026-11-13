@@ -1407,6 +1407,13 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // An app that dies inside ?2026h must not freeze the screen.
+        if self.term.expire_sync_output() {
+            if let (Some(text), Some(window)) = (self.text.as_mut(), self.window.as_ref()) {
+                text.buffer = None;
+                window.request_redraw();
+            }
+        }
         // Belt-and-braces: also drain here in case a wake event coalesced.
         self.drain_pty();
         // While a selection drag sits past the top/bottom edge, poll the loop

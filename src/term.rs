@@ -150,6 +150,9 @@ pub struct Term {
     /// Whether OSC 52 writes / read-queries are honoured.
     pub osc52_write: bool,
     pub osc52_read: bool,
+    /// Synchronized output (`?2026`): repaints are held until cleared.
+    pub sync_output: bool,
+    sync_started: Option<std::time::Instant>,
     responses: Vec<Vec<u8>>,
     dirty: bool,
 }
@@ -191,6 +194,8 @@ impl Term {
             clipboard_query: false,
             osc52_write: true,
             osc52_read: true,
+            sync_output: false,
+            sync_started: None,
             responses: Vec::new(),
             dirty: true,
         }
@@ -254,7 +259,26 @@ impl Term {
         for &b in bytes {
             parser.advance(self, b);
         }
-        self.dirty = true;
+        // ?2026 synchronized output: parse everything, paint nothing until
+        // the app clears the mode.
+        if !self.sync_output {
+            self.dirty = true;
+        }
+    }
+
+    /// Safety valve: an app that never clears `?2026` must not freeze the
+    /// screen. Returns `true` when a stuck sync was just expired.
+    pub fn expire_sync_output(&mut self) -> bool {
+        if self.sync_output
+            && self
+                .sync_started
+                .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(2))
+        {
+            self.sync_output = false;
+            self.dirty = true;
+            return true;
+        }
+        false
     }
 
     pub fn take_dirty(&mut self) -> bool {
@@ -659,6 +683,13 @@ impl Term {
             1006 => self.mouse_sgr = enabled,
             25 => self.cursor_visible = enabled,
             2004 => self.bracketed_paste = enabled,
+            2026 => {
+                self.sync_output = enabled;
+                self.sync_started = enabled.then(std::time::Instant::now);
+                if !enabled {
+                    self.dirty = true;
+                }
+            }
             47 | 1047 | 1049 => {
                 if enabled {
                     if self.saved.is_none() {
@@ -919,6 +950,8 @@ impl Perform for Term {
                 self.clipboard_writes.clear();
                 self.clipboard_query = false;
                 self.row_wrapped.iter_mut().for_each(|f| *f = false);
+                self.sync_output = false;
+                self.sync_started = None;
                 self.reset_pen();
             }
             b'D' => self.linefeed(),
@@ -1306,6 +1339,34 @@ mod tests {
         // Empty selection field also means the system clipboard.
         feed(&mut t, "\x1b]52;;d29ybGQ=\x07");
         assert_eq!(t.take_clipboard_writes(), vec!["world".to_string()]);
+    }
+
+    #[test]
+    fn synchronized_output_holds_and_releases_painting() {
+        let mut t = Term::new(10, 3);
+        feed(&mut t, "\x1b[?2026h");
+        assert!(t.take_dirty(), "consume the pre-sync dirty flag");
+        feed(&mut t, "hi");
+        assert!(t.sync_output);
+        assert!(!t.take_dirty(), "no repaint while ?2026 is on");
+
+        // Mode clears: the whole batch paints at once.
+        feed(&mut t, "\x1b[?2026l");
+        assert!(!t.sync_output);
+        assert!(t.take_dirty());
+        assert_eq!(row_text(&t, 0), "hi");
+
+        // A stuck sync expires after the safety timeout.
+        feed(&mut t, "\x1b[?2026h");
+        t.sync_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
+        assert!(t.expire_sync_output());
+        assert!(!t.sync_output);
+        assert!(t.take_dirty());
+
+        // Full reset clears it too.
+        feed(&mut t, "\x1b[?2026h");
+        feed(&mut t, "\x1bc");
+        assert!(!t.sync_output);
     }
 
     #[test]
