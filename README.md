@@ -113,9 +113,9 @@ with `clipboard-write = false` / `clipboard-read = false` in the config file.
 
 ## What is missing (the honest list)
 
-- Tabs, splits, multiple windows.
-- OSC 7 cwd is surfaced in the window title (when no app-set title).
-- Server/daemon mode, shell integration, notifications, kitty graphics protocol.
+- Tabs, splits in-window (tab sessions and **Ctrl+Shift+N** new window added; no tab bar/splits yet).
+- Server/daemon mode.
+- Kitty graphics protocol (not implemented).
 
 ## Architecture
 

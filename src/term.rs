@@ -162,6 +162,10 @@ pub struct Term {
     pub title: Option<String>,
     /// Current working directory reported via OSC 7, if any.
     pub cwd: Option<String>,
+    /// Pending desktop notifications (OSC 9 / OSC 777).
+    notifications: Vec<String>,
+    /// OSC 133 shell integration: current prompt mark state (A/B/C/D seen).
+    pub prompt_state: Option<char>,
     /// Texts queued by OSC 52 for the app to put on the clipboard.
     clipboard_writes: Vec<String>,
     /// Set when an app queries the clipboard with OSC 52 `?`.
@@ -219,6 +223,8 @@ impl Term {
             focus_reporting: false,
             title: None,
             cwd: None,
+            notifications: Vec::new(),
+            prompt_state: None,
             clipboard_writes: Vec::new(),
             clipboard_query: false,
             osc52_write: true,
@@ -363,6 +369,11 @@ impl Term {
     /// Whether an application queried the clipboard via OSC 52 `?`.
     pub fn take_clipboard_query(&mut self) -> bool {
         std::mem::take(&mut self.clipboard_query)
+    }
+
+    /// Desktop notifications requested by OSC 9 / OSC 777.
+    pub fn take_notifications(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notifications)
     }
 
     /// Grid accessor used by tests (rendering goes through [`Term::line`]).
@@ -1087,6 +1098,8 @@ impl Perform for Term {
                 self.reset_tab_stops();
                 self.title = None;
                 self.cwd = None;
+                self.notifications.clear();
+                self.prompt_state = None;
                 self.reset_pen();
             }
             b'D' => self.linefeed(),
@@ -1168,6 +1181,45 @@ impl Perform for Term {
             if let Some(uri) = params.get(1) {
                 let uri = String::from_utf8_lossy(uri);
                 self.cwd = Some(parse_osc7_path(&uri));
+            }
+        }
+        // OSC 9: desktop notification (ConEmu/iTerm2 style: "9;message").
+        if params.first().is_some_and(|p| *p == b"9") {
+            let msg = params
+                .get(1..)
+                .map(|rest| String::from_utf8_lossy(&rest.join(&b';')).into_owned())
+                .unwrap_or_default();
+            if !msg.is_empty() {
+                self.notifications.push(msg);
+            }
+        }
+        // OSC 777: e.g. "777;notify;title;body".
+        if params.first().is_some_and(|p| *p == b"777")
+            && params.get(1).is_some_and(|p| *p == b"notify")
+        {
+            let title = params
+                .get(2)
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .unwrap_or_default();
+            let body = params
+                .get(3..)
+                .map(|rest| String::from_utf8_lossy(&rest.join(&b';')).into_owned())
+                .unwrap_or_default();
+            let msg = if title.is_empty() {
+                body
+            } else if body.is_empty() {
+                title
+            } else {
+                format!("{title}: {body}")
+            };
+            if !msg.is_empty() {
+                self.notifications.push(msg);
+            }
+        }
+        // OSC 133: shell integration prompt marks (A/B/C/D).
+        if params.first().is_some_and(|p| *p == b"133") {
+            if let Some(mark) = params.get(1).and_then(|p| p.first()).map(|b| *b as char) {
+                self.prompt_state = Some(mark);
             }
         }
     }
@@ -1700,6 +1752,25 @@ mod tests {
         assert_eq!(t.cwd.as_deref(), Some("/home/user/project"));
         feed(&mut t, "\x1b]7;file:///C:/Users/dev\x07");
         assert_eq!(t.cwd.as_deref(), Some("C:/Users/dev"));
+    }
+
+    #[test]
+    fn osc9_and_777_queue_notifications() {
+        let mut t = Term::new(20, 2);
+        feed(&mut t, "\x1b]9;hello\x07\x1b]777;notify;Title;Body\x07");
+        assert_eq!(
+            t.take_notifications(),
+            vec!["hello".to_string(), "Title: Body".to_string()]
+        );
+    }
+
+    #[test]
+    fn osc133_prompt_marks() {
+        let mut t = Term::new(20, 2);
+        feed(&mut t, "\x1b]133;A\x07");
+        assert_eq!(t.prompt_state, Some('A'));
+        feed(&mut t, "\x1b]133;B\x07");
+        assert_eq!(t.prompt_state, Some('B'));
     }
 
     #[test]

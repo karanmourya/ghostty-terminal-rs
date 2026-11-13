@@ -1074,6 +1074,9 @@ impl App {
                 let reply = format!("\x1b]52;c;{}\x1b\\", term::base64_encode(text.as_bytes()));
                 self.write_pty(reply.as_bytes());
             }
+            for msg in self.term.take_notifications() {
+                show_notification(&msg);
+            }
             if self.search.is_some() {
                 if let Some(s) = self.search.as_mut() {
                     s.recompute(&self.term);
@@ -1610,7 +1613,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
-                // Ctrl+Shift+C copies selection, A copies all, F toggles search.
+                // Ctrl+Shift+C copies selection, A copies all, F toggles search, N new window.
                 if self.modifiers.control_key() && self.modifiers.shift_key() {
                     if let Key::Character(text) = &event.logical_key {
                         if text.eq_ignore_ascii_case("c") {
@@ -1626,6 +1629,12 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.search_close();
                             } else {
                                 self.search_open();
+                            }
+                            return;
+                        }
+                        if text.eq_ignore_ascii_case("n") {
+                            if let Ok(exe) = std::env::current_exe() {
+                                let _ = std::process::Command::new(exe).spawn();
                             }
                             return;
                         }
@@ -1896,6 +1905,21 @@ fn set_clipboard(text: &str) {
     if let Ok(mut clipboard) = arboard::Clipboard::new() {
         let _ = clipboard.set_text(text.to_string());
     }
+}
+
+fn show_notification(msg: &str) {
+    // Best-effort Windows tray notification.
+    let body = msg.replace('\'', "''");
+    let script = format!(
+        "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; \
+         $n=New-Object System.Windows.Forms.NotifyIcon; \
+         $n.Icon=[System.Drawing.SystemIcons]::Information; $n.Visible=$true; \
+         $n.ShowBalloonTip(4000,'Ghostty','{body}',[System.Windows.Forms.ToolTipIcon]::Info); \
+         Start-Sleep -Seconds 5; $n.Dispose()"
+    );
+    let _ = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+        .spawn();
 }
 
 fn get_clipboard() -> Option<String> {
