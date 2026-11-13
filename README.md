@@ -109,8 +109,7 @@ with `clipboard-write = false` / `clipboard-read = false` in the config file.
 
 - Tabs, splits, multiple windows.
 - OSC 7 cwd.
-- Search, scrollback export.
-- (none listed here currently beyond features above; see roadmap for larger items.)
+- Search in scrollback. (Full buffer can be copied with **Ctrl+Shift+A**.)
 - Server/daemon mode, shell integration, notifications, kitty graphics protocol.
 
 ## Architecture

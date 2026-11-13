@@ -714,6 +714,18 @@ impl App {
         }
     }
 
+    /// Copy the entire scrollback + visible screen as plain text.
+    fn copy_all(&mut self) {
+        let last = self.term.total_lines().saturating_sub(1);
+        let sel = Selection {
+            anchor: (0, 0),
+            head: (last, self.term.cols.saturating_sub(1)),
+        };
+        if let Some(text) = selection_text(&self.term, sel) {
+            set_clipboard(&text);
+        }
+    }
+
     /// Ctrl+click on an OSC 8 hyperlink. Only http(s) URLs are launched, so
     /// terminal output cannot invoke arbitrary protocol handlers.
     fn open_link_at(&self, cell: (usize, usize)) -> bool {
@@ -1320,11 +1332,15 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
-                // Ctrl+Shift+C copies the selection (plain Ctrl+C stays SIGINT).
+                // Ctrl+Shift+C copies the selection, Ctrl+Shift+A copies all.
                 if self.modifiers.control_key() && self.modifiers.shift_key() {
                     if let Key::Character(text) = &event.logical_key {
                         if text.eq_ignore_ascii_case("c") {
                             self.copy_selection();
+                            return;
+                        }
+                        if text.eq_ignore_ascii_case("a") {
+                            self.copy_all();
                             return;
                         }
                     }
