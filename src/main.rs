@@ -155,7 +155,8 @@ struct Text {
     viewport: Viewport,
     atlas: TextAtlas,
     renderer: GlyphonRenderer,
-    buffer: Option<Buffer>,
+    /// One shaped buffer per visible row, so only changed rows re-shape.
+    rows: Vec<RowBuffer>,
     /// Configured font size before DPI scaling.
     base_font_size: f32,
     font_size: f32,
@@ -163,6 +164,13 @@ struct Text {
     line_height: f32,
     cell_width: f32,
     dirty: bool,
+}
+
+struct RowBuffer {
+    buffer: Buffer,
+    /// Fingerprint of the grid row the buffer was shaped from; `u64::MAX`
+    /// means "never shaped".
+    key: u64,
 }
 
 impl Text {
@@ -196,7 +204,7 @@ impl Text {
             viewport,
             atlas,
             renderer,
-            buffer: None,
+            rows: Vec::new(),
             base_font_size: config.font_size,
             font_size,
             family,
@@ -219,33 +227,47 @@ impl Text {
             self.font_size,
             self.line_height,
         );
-        self.buffer = None;
+        // Geometry changed: every row's shaping is stale.
+        self.rows.clear();
         self.dirty = true;
     }
 
-    /// Rebuild the shaped text buffer from the terminal grid.
+    /// Rebuild the shaped text from the terminal grid. Rows whose content is
+    /// unchanged reuse their previous buffer, so typing only re-shapes the
+    /// line that changed instead of the whole screen.
     fn rebuild(&mut self, term: &Term, scroll: usize, width: f32, height: f32) {
-        let mut buffer = Buffer::new(
-            &mut self.font_system,
-            Metrics::new(self.font_size, self.line_height),
-        );
-        // Give shaping far more room than the window: a terminal never soft-wraps
-        // (the grid already decided where lines end), and clipping is handled by
-        // the TextArea bounds. Too-narrow a width would shift rows.
-        buffer.set_size(
-            &mut self.font_system,
-            Some((width * 8.0).max(1024.0)),
-            Some(height.max(1.0)),
-        );
+        use std::hash::{DefaultHasher, Hash, Hasher};
 
-        // Group horizontal runs of identical style into spans so colored output
-        // shapes in one pass instead of one buffer per cell.
-        let mut spans: Vec<(String, Attrs<'static>)> = Vec::new();
         let top = term.scrollback_len().saturating_sub(scroll);
+        // Give shaping far more room than the window: a terminal never
+        // soft-wraps (the grid already decided where lines end), and clipping
+        // is handled by the TextArea bounds.
+        let size_w = Some((width * 8.0).max(1024.0));
+        let size_h = Some(height.max(1.0));
+
+        while self.rows.len() < term.rows {
+            let buffer = Buffer::new(
+                &mut self.font_system,
+                Metrics::new(self.font_size, self.line_height),
+            );
+            self.rows.push(RowBuffer {
+                buffer,
+                key: u64::MAX,
+            });
+        }
+        self.rows.truncate(term.rows);
+
+        let default_attrs = attrs(term.foreground(), false, false, &self.family);
         for y in 0..term.rows {
+            let line = term.line(top + y);
+            let mut hasher = DefaultHasher::new();
+            line.is_none().hash(&mut hasher);
+
+            // Group horizontal runs of identical style into spans so colored
+            // output shapes in one pass instead of one buffer per cell.
+            let mut spans: Vec<(String, Attrs<'static>)> = Vec::new();
             let mut text = String::with_capacity(term.cols);
             let mut current: Option<([u8; 3], bool, bool)> = None;
-            let line = term.line(top + y);
             for x in 0..term.cols {
                 // Missing lines (only possible mid-resize) render as blanks.
                 let cell = match line.and_then(|line| line.get(x)) {
@@ -256,6 +278,10 @@ impl Text {
                     // Right half of a wide glyph: the glyph itself advances.
                     continue;
                 }
+                cell.ch.hash(&mut hasher);
+                cell.fg.hash(&mut hasher);
+                cell.bold.hash(&mut hasher);
+                cell.underline.hash(&mut hasher);
                 let style = (cell.fg, cell.bold, cell.underline);
                 if current != Some(style) {
                     if let Some((fg, bold, underline)) = current {
@@ -274,22 +300,25 @@ impl Text {
                     attrs(fg, bold, underline, &self.family),
                 ));
             }
-            // Terminate the row; cosmic-text creates one layout line per '\n'.
-            match spans.last_mut() {
-                Some((last, _)) => last.push('\n'),
-                None => spans.push(("\n".to_owned(), Attrs::new())),
+            let key = hasher.finish();
+
+            let row = &mut self.rows[y];
+            if row.key == key {
+                continue;
             }
+            if spans.is_empty() {
+                spans.push((String::new(), default_attrs));
+            }
+            row.buffer.set_size(&mut self.font_system, size_w, size_h);
+            row.buffer.set_rich_text(
+                &mut self.font_system,
+                spans.iter().map(|(text, attrs)| (text.as_str(), *attrs)),
+                default_attrs,
+                Shaping::Advanced,
+            );
+            row.buffer.shape_until_scroll(&mut self.font_system, false);
+            row.key = key;
         }
-
-        buffer.set_rich_text(
-            &mut self.font_system,
-            spans.iter().map(|(text, attrs)| (text.as_str(), *attrs)),
-            attrs(term.foreground(), false, false, &self.family),
-            Shaping::Advanced,
-        );
-        buffer.shape_until_scroll(&mut self.font_system, false);
-
-        self.buffer = Some(buffer);
         self.dirty = false;
     }
 }
@@ -451,7 +480,7 @@ impl App {
             });
         }
         if let Some(text) = self.text.as_mut() {
-            text.buffer = None;
+            text.dirty = true;
         }
         self.scroll = self.scroll.min(self.term.scrollback_len());
     }
@@ -471,7 +500,7 @@ impl App {
         }
         self.scroll = next;
         if let Some(text) = self.text.as_mut() {
-            text.buffer = None;
+            text.dirty = true;
         }
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
@@ -817,7 +846,7 @@ impl App {
                 self.write_pty(reply.as_bytes());
             }
             if let (Some(text), Some(window)) = (self.text.as_mut(), self.window.as_ref()) {
-                text.buffer = None;
+                text.dirty = true;
                 window.request_redraw();
             }
             if let Some(title) = self.term.title.clone() {
@@ -939,7 +968,7 @@ impl App {
         let line_h = text.line_height;
         let padding = self.config.padding;
 
-        if text.dirty || text.buffer.is_none() {
+        if text.dirty {
             text.rebuild(&self.term, self.scroll, surface_width, surface_height);
         }
 
@@ -1086,17 +1115,20 @@ impl App {
             },
         );
 
-        let buffer = text.buffer.as_ref().expect("text buffer");
-        let prepared = text.renderer.prepare(
-            &gpu.device,
-            &gpu.queue,
-            &mut text.font_system,
-            &mut text.atlas,
-            &text.viewport,
-            [TextArea {
-                buffer,
+        let default_color = Color::rgb(
+            self.term.foreground()[0],
+            self.term.foreground()[1],
+            self.term.foreground()[2],
+        );
+        // One TextArea per row: rows keep their shaped buffers between frames.
+        let areas: Vec<TextArea> = text
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(y, row)| TextArea {
+                buffer: &row.buffer,
                 left: padding,
-                top: padding,
+                top: padding + y as f32 * text.line_height,
                 scale: 1.0,
                 bounds: TextBounds {
                     left: 0,
@@ -1104,13 +1136,17 @@ impl App {
                     right: gpu.config.width as i32,
                     bottom: gpu.config.height as i32,
                 },
-                default_color: Color::rgb(
-                    self.term.foreground()[0],
-                    self.term.foreground()[1],
-                    self.term.foreground()[2],
-                ),
+                default_color,
                 custom_glyphs: &[],
-            }],
+            })
+            .collect();
+        let prepared = text.renderer.prepare(
+            &gpu.device,
+            &gpu.queue,
+            &mut text.font_system,
+            &mut text.atlas,
+            &text.viewport,
+            areas,
             &mut text.swash,
         );
         if let Err(err) = prepared {
@@ -1226,7 +1262,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.sync_size();
                 if let Some(text) = self.text.as_mut() {
-                    text.buffer = None;
+                    text.dirty = true;
                 }
                 if let Some(window) = self.window.as_ref() {
                     window.request_redraw();
@@ -1450,7 +1486,7 @@ impl ApplicationHandler<UserEvent> for App {
         // An app that dies inside ?2026h must not freeze the screen.
         if self.term.expire_sync_output() {
             if let (Some(text), Some(window)) = (self.text.as_mut(), self.window.as_ref()) {
-                text.buffer = None;
+                text.dirty = true;
                 window.request_redraw();
             }
         }

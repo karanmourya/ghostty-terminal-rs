@@ -132,8 +132,10 @@ Rendering happens on a single GPU pass:
 1. Clear to the default background.
 2. Draw one instanced rectangle per cell that has a non-default background
    (plus underlines and the cursor outline).
-3. Draw all glyphs with glyphon from **one** shaped buffer (rich text spans for
-   per-run colors, so a screen costs one shaping pass, not one per cell).
+3. Draw all glyphs with glyphon from one shaped buffer **per visible row**
+   (rich text spans for per-run colors). A row's content fingerprint is cached,
+   so a keystroke re-shapes only the rows that changed instead of the whole
+   screen.
 
 Text shaping uses generous buffer width so cosmic-text never soft-wraps; the
 terminal grid owns line breaking.
@@ -200,7 +202,7 @@ cargo run --release
 5. ~~Clipboard polish~~ — OSC 52 and auto-scroll done (triple-click included).
 6. ~~Resize reflow~~ — soft-wrap join + re-wrap, verified live.
 7. **Tabs/splits** — requires a window manager layer above `winit` windows.
-8. **Performance pass** — dirty-row tracking, glyph cache reuse, frame pacing.
+8. ~~Performance pass~~ — per-row shaped buffers + content fingerprint cache (dirty rows only), done. Frame pacing left if needed.
 
 ## Legal
 
