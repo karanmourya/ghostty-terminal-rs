@@ -36,6 +36,7 @@ cargo run --release       # optimised
 | Drag / double-click / triple-click selection, copy-on-select, Ctrl+Shift+C | ✅ |
 | OSC 52 clipboard (write, `?` read-query; gated by `clipboard-write`/`clipboard-read`) | ✅ |
 | Synchronized output (`?2026`) with a 2 s stuck-sync safety valve | ✅ |
+| Scroll regions (`DECSTBM`); region scrolls never pollute history | ✅ |
 | Scrollback (10 000 lines) + mouse wheel, Shift+PgUp/PgDn/Home/End | ✅ (overlay scrollbar) |
 | **Resize reflow** — soft-wrapped lines are joined and re-wrapped on resize | ✅ (wide glyphs never split) |
 | DPI scaling | ✅ |
@@ -101,7 +102,7 @@ with `clipboard-write = false` / `clipboard-read = false` in the config file.
 - Tabs, splits, multiple windows.
 - OSC 8 hyperlinks, OSC 7 cwd.
 - Search, scrollback export.
-- Scroll regions (`DECSTBM`), tab stops beyond every 8 columns.
+- Tab stops beyond every 8 columns.
 - Server/daemon mode, shell integration, notifications, kitty graphics protocol.
 
 ## Architecture

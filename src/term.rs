@@ -112,6 +112,9 @@ pub struct Term {
     scrollback: VecDeque<HistLine>,
     /// Soft-wrap flag per visible row (this row continues onto the next).
     row_wrapped: Vec<bool>,
+    /// Vertical scrolling region (`DECSTBM`), inclusive row indices.
+    scroll_top: usize,
+    scroll_bottom: usize,
     cx: usize,
     cy: usize,
     fg: [u8; 3],
@@ -167,6 +170,8 @@ impl Term {
             cells: vec![Cell::blank(DEFAULT_FG, DEFAULT_BG); cols * rows],
             scrollback: VecDeque::new(),
             row_wrapped: vec![false; rows],
+            scroll_top: 0,
+            scroll_bottom: rows - 1,
             cx: 0,
             cy: 0,
             fg: DEFAULT_FG,
@@ -379,6 +384,8 @@ impl Term {
         self.row_wrapped.resize(rows, false);
         self.cols = cols;
         self.rows = rows;
+        self.scroll_top = 0;
+        self.scroll_bottom = rows - 1;
         self.cx = self.cx.min(cols - 1);
         self.cy = self.cy.min(rows - 1);
         self.wrap_pending = false;
@@ -496,6 +503,9 @@ impl Term {
         }
         self.cols = cols;
         self.rows = rows;
+        // Margins are geometry: drop back to the full screen on resize.
+        self.scroll_top = 0;
+        self.scroll_bottom = rows - 1;
         self.cx = self.cx.min(cols - 1);
         self.cy = self.cy.min(rows - 1);
         self.wrap_pending = false;
@@ -506,23 +516,28 @@ impl Term {
     }
 
     fn scroll_up(&mut self, count: usize) {
-        let n = count.min(self.rows);
+        let top = self.scroll_top.min(self.rows - 1);
+        let bottom = self.scroll_bottom.min(self.rows - 1);
+        let n = count.min(bottom - top + 1);
         if n == 0 {
             return;
         }
-        // Only the primary screen feeds scrollback; the alternate screen
-        // (vim, less, htop) must not pollute history.
-        if self.saved.is_none() {
+        // Only a full-screen scroll on the primary screen feeds history; a
+        // region scroll (vim splits, htop) drops its top line instead.
+        if self.saved.is_none() && top == 0 && bottom + 1 == self.rows {
             for row in 0..n {
                 self.push_history_row(row);
             }
         }
-        self.cells.copy_within(n * self.cols.., 0);
+        self.cells.copy_within(
+            (top + n) * self.cols..(bottom + 1) * self.cols,
+            top * self.cols,
+        );
         // Wrap flags belong to the rows, so they shift with them.
-        self.row_wrapped.copy_within(n.., 0);
-        self.row_wrapped[self.rows - n..].fill(false);
+        self.row_wrapped.copy_within(top + n..bottom + 1, top);
+        self.row_wrapped[bottom + 1 - n..bottom + 1].fill(false);
         let blank = self.blank();
-        for c in self.cells[(self.rows - n) * self.cols..].iter_mut() {
+        for c in self.cells[(bottom + 1 - n) * self.cols..(bottom + 1) * self.cols].iter_mut() {
             *c = blank;
         }
     }
@@ -539,16 +554,20 @@ impl Term {
     }
 
     fn scroll_down(&mut self, count: usize) {
-        let n = count.min(self.rows);
+        let top = self.scroll_top.min(self.rows - 1);
+        let bottom = self.scroll_bottom.min(self.rows - 1);
+        let n = count.min(bottom - top + 1);
         if n == 0 {
             return;
         }
-        self.cells
-            .copy_within(..(self.rows - n) * self.cols, n * self.cols);
-        self.row_wrapped.copy_within(..self.rows - n, n);
-        self.row_wrapped[..n].fill(false);
+        self.cells.copy_within(
+            top * self.cols..(bottom + 1 - n) * self.cols,
+            (top + n) * self.cols,
+        );
+        self.row_wrapped.copy_within(top..bottom + 1 - n, top + n);
+        self.row_wrapped[top..top + n].fill(false);
         let blank = self.blank();
-        for c in self.cells[..n * self.cols].iter_mut() {
+        for c in self.cells[top * self.cols..(top + n) * self.cols].iter_mut() {
             *c = blank;
         }
     }
@@ -562,10 +581,11 @@ impl Term {
     }
 
     fn linefeed(&mut self) {
-        if self.cy + 1 < self.rows {
-            self.cy += 1;
-        } else {
+        let bottom = self.scroll_bottom.min(self.rows - 1);
+        if self.cy == bottom {
             self.scroll_up(1);
+        } else {
+            self.cy = (self.cy + 1).min(self.rows - 1);
         }
         self.wrap_pending = false;
     }
@@ -904,6 +924,20 @@ impl Perform for Term {
             }
             'S' => self.scroll_up(arg(0, 1)),
             'T' => self.scroll_down(arg(0, 1)),
+            'r' if !private => {
+                // DECSTBM: set the scrolling region, then home the cursor.
+                let top = arg(0, 1).saturating_sub(1);
+                let bottom = arg(1, self.rows as u16)
+                    .saturating_sub(1)
+                    .min(self.rows - 1);
+                if top < bottom {
+                    self.scroll_top = top;
+                    self.scroll_bottom = bottom;
+                }
+                self.cx = 0;
+                self.cy = 0;
+                self.wrap_pending = false;
+            }
             'X' => self.clear_row(self.cy, self.cx, self.cx + arg(0, 1)),
             'n' => match p.first().copied().unwrap_or(0) {
                 6 => {
@@ -952,6 +986,8 @@ impl Perform for Term {
                 self.row_wrapped.iter_mut().for_each(|f| *f = false);
                 self.sync_output = false;
                 self.sync_started = None;
+                self.scroll_top = 0;
+                self.scroll_bottom = self.rows - 1;
                 self.reset_pen();
             }
             b'D' => self.linefeed(),
@@ -960,9 +996,9 @@ impl Perform for Term {
                 self.linefeed();
             }
             b'M' => {
-                if self.cy > 0 {
+                if self.cy > self.scroll_top {
                     self.cy -= 1;
-                } else {
+                } else if self.cy == self.scroll_top {
                     self.scroll_down(1);
                 }
             }
@@ -1208,6 +1244,23 @@ mod tests {
         assert_eq!(t.scrollback_len(), 0);
         assert_eq!(line_text(&t, 0), "one");
         assert_eq!(line_text(&t, 1), "hello world");
+    }
+
+    #[test]
+    fn scroll_region_confines_scrolling() {
+        let mut t = Term::new(6, 5);
+        // DECSTBM: rows 2..=4 (1-based); the cursor homes.
+        feed(&mut t, "\x1b[2;4r");
+        assert_eq!(t.cursor(), (0, 0));
+        feed(&mut t, "top");
+        // Write inside the region, overflowing its bottom margin.
+        feed(&mut t, "\x1b[4;1Ha\r\nb\r\nc");
+        assert_eq!(line_text(&t, 0), "top", "rows above the region stay put");
+        assert_eq!(line_text(&t, 1), "a");
+        assert_eq!(line_text(&t, 2), "b");
+        assert_eq!(line_text(&t, 3), "c");
+        assert_eq!(line_text(&t, 4), "", "rows below the region stay put");
+        assert_eq!(t.scrollback_len(), 0, "region scrolls do not fill history");
     }
 
     #[test]
