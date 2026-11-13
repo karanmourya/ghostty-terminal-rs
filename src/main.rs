@@ -94,27 +94,37 @@ impl SearchState {
             self.current = 0;
             return;
         }
-        let qlen = query.chars().count().max(1);
+        let qlen = query.chars().count();
         for line in 0..term.total_lines() {
             let Some(cells) = term.line(line) else {
                 continue;
             };
             let mut text = String::new();
             let mut cols: Vec<usize> = Vec::new();
+            let mut widths: Vec<usize> = Vec::new();
             for (x, cell) in cells.iter().enumerate() {
                 if cell.ch == '\0' {
                     continue;
                 }
+                let w = unicode_width::UnicodeWidthChar::width(cell.ch)
+                    .unwrap_or(1)
+                    .max(1);
                 for ch in cell.ch.to_lowercase() {
                     text.push(ch);
                     cols.push(x);
+                    widths.push(w);
                 }
             }
             let mut start = 0;
             while let Some(rel) = text[start..].find(&query) {
                 let idx = start + rel;
                 let col = cols.get(idx).copied().unwrap_or(0);
-                self.matches.push((line, col, qlen));
+                let span = if qlen > 0 && idx + qlen <= cols.len() {
+                    cols[idx + qlen - 1] + widths[idx + qlen - 1] - col
+                } else {
+                    qlen.max(1)
+                };
+                self.matches.push((line, col, span.max(1)));
                 let next = text[idx..]
                     .chars()
                     .next()
@@ -573,6 +583,14 @@ impl App {
         };
         if let Some(title) = self.term.title.clone() {
             window.set_title(&format!("{title} - Ghostty (Rust)"));
+        } else if let Some(cwd) = self.term.cwd.as_deref() {
+            let name = cwd
+                .trim_end_matches(['/', '\\'])
+                .rsplit(['/', '\\'])
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(cwd);
+            window.set_title(&format!("{name} - Ghostty (Rust)"));
         } else {
             window.set_title("Ghostty (Rust) - Windows");
         }
@@ -1056,12 +1074,17 @@ impl App {
                 let reply = format!("\x1b]52;c;{}\x1b\\", term::base64_encode(text.as_bytes()));
                 self.write_pty(reply.as_bytes());
             }
+            if self.search.is_some() {
+                if let Some(s) = self.search.as_mut() {
+                    s.recompute(&self.term);
+                }
+                self.sync_search_title();
+            } else {
+                self.sync_window_title();
+            }
             if let (Some(text), Some(window)) = (self.text.as_mut(), self.window.as_ref()) {
                 text.dirty = true;
                 window.request_redraw();
-            }
-            if self.search.is_none() {
-                self.sync_window_title();
             }
         }
     }
