@@ -33,7 +33,7 @@ cargo run --release       # optimised
 | Bracketed paste (`?2004`) | ✅ |
 | Mouse reporting: `?1000`/`?1002`/`?1003`, SGR `?1006` and legacy X10 | ✅ |
 | Focus reporting (`?1004`) | ✅ |
-| Drag / double-click selection, copy-on-select, Ctrl+Shift+C | ✅ |
+| Drag / double-click / triple-click selection, copy-on-select, Ctrl+Shift+C | ✅ |
 | OSC 52 clipboard (write, `?` read-query; gated by `clipboard-write`/`clipboard-read`) | ✅ |
 | Scrollback (10 000 lines) + mouse wheel, Shift+PgUp/PgDn/Home/End | ✅ (overlay scrollbar) |
 | **Resize reflow** — soft-wrapped lines are joined and re-wrapped on resize | ✅ (wide glyphs never split) |
@@ -79,7 +79,8 @@ implemented: `?1000` (clicks), `?1002` (drag), `?1003` (any motion).
 
 ## Selection
 
-Drag with the left button to select, double-click for a word. The selection is
+Drag with the left button to select, double-click for a word, triple-click for
+a whole line. The selection is
 highlighted behind the text, stays attached to its lines while you scroll, and
 is copied to the clipboard when you release the mouse. Ctrl+Shift+C copies it
 again; typing or clicking elsewhere clears it. When an application has enabled
@@ -97,7 +98,6 @@ with `clipboard-write = false` / `clipboard-read = false` in the config file.
 ## What is missing (the honest list)
 
 - Tabs, splits, multiple windows.
-- Triple-click line selection.
 - OSC 8 hyperlinks, OSC 7 cwd.
 - Synchronized output (`?2026`).
 - Search, scrollback export.
@@ -188,7 +188,7 @@ cargo run --release
 2. ~~Mouse reporting~~ — done.
 3. ~~Selection + clipboard~~ — done.
 4. ~~Config~~ — done.
-5. ~~Clipboard polish~~ — OSC 52 and auto-scroll done (triple-click still open).
+5. ~~Clipboard polish~~ — OSC 52 and auto-scroll done (triple-click included).
 6. ~~Resize reflow~~ — soft-wrap join + re-wrap, verified live.
 7. **Tabs/splits** — requires a window manager layer above `winit` windows.
 8. **Performance pass** — dirty-row tracking, glyph cache reuse, frame pacing.

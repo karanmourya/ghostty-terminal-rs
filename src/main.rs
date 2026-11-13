@@ -366,6 +366,8 @@ struct App {
     selecting: bool,
     /// Time and cell of the previous primary click, for double-click words.
     last_click: Option<(std::time::Instant, (usize, usize))>,
+    /// Consecutive fast clicks on the same cell: 1 char, 2 word, 3+ line.
+    click_count: u32,
 
     modifiers: ModifiersState,
     width: u32,
@@ -409,6 +411,7 @@ impl App {
             selection: None,
             selecting: false,
             last_click: None,
+            click_count: 0,
             modifiers: ModifiersState::empty(),
             width: 1000,
             height: 640,
@@ -563,7 +566,20 @@ impl App {
             .unwrap_or(false);
         self.last_click = Some((now, at));
         self.selecting = true;
+        self.click_count = if double_click {
+            self.click_count + 1
+        } else {
+            1
+        };
         if double_click {
+            if self.click_count >= 3 {
+                // Triple click: the whole visual line.
+                self.set_selection(Some(Selection {
+                    anchor: (at.0, 0),
+                    head: (at.0, self.term.cols.saturating_sub(1)),
+                }));
+                return;
+            }
             if let Some(word) = self.word_selection(at) {
                 self.set_selection(Some(word));
                 return;
