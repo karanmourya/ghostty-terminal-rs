@@ -111,9 +111,16 @@ Applications can set the clipboard with `OSC 52 ; c ; <base64>` and read it
 back with `OSC 52 ; c ; ?`. Both are enabled by default and can be turned off
 with `clipboard-write = false` / `clipboard-read = false` in the config file.
 
+## Tabs and windows
+
+- **Ctrl+Shift+T**: new tab (separate shell session). **Ctrl+Shift+W**: close tab (closes window on last tab).
+- **Ctrl+Tab** / **Ctrl+PageDown**: next tab. **Ctrl+Shift+Tab** / **Ctrl+PageUp**: previous tab.
+- **Ctrl+Shift+N**: open a new window (new process).
+- Functional sessions without a visual tab bar; splits are not implemented.
+
 ## What is missing (the honest list)
 
-- Tabs, splits in-window (tab sessions and **Ctrl+Shift+N** new window added; no tab bar/splits yet).
+- Visual tab bar and in-window splits.
 - Server/daemon mode.
 - Kitty graphics protocol (not implemented).
 

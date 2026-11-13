@@ -449,6 +449,25 @@ fn measure_cell(
 // App
 // ---------------------------------------------------------------------------
 
+struct TabState {
+    term: Term,
+    parser: vte::Parser,
+    pty_writer: Option<Box<dyn std::io::Write + Send>>,
+    pty_master: Option<Box<dyn MasterPty + Send>>,
+    rx: Option<Receiver<Vec<u8>>>,
+    scroll: usize,
+    pointer_cell: (usize, usize),
+    pointer_physical: Option<(f64, f64)>,
+    last_autoscroll: Instant,
+    mouse_down: Option<u8>,
+    selection: Option<Selection>,
+    selecting: bool,
+    last_click: Option<(std::time::Instant, (usize, usize))>,
+    click_count: u32,
+    over_link: bool,
+    search: Option<SearchState>,
+}
+
 struct App {
     gpu: Option<Gpu>,
     text: Option<Text>,
@@ -485,6 +504,10 @@ struct App {
     over_link: bool,
     /// Scrollback search mode (Ctrl+Shift+F).
     search: Option<SearchState>,
+
+    /// Inactive tab sessions (active tab lives in the fields above).
+    inactive_tabs: Vec<TabState>,
+    active_tab: usize,
 
     modifiers: ModifiersState,
     width: u32,
@@ -531,6 +554,8 @@ impl App {
             click_count: 0,
             over_link: false,
             search: None,
+            inactive_tabs: Vec::new(),
+            active_tab: 0,
             modifiers: ModifiersState::empty(),
             width: 1000,
             height: 640,
@@ -958,6 +983,145 @@ impl App {
             .args(["url.dll,FileProtocolHandler", url])
             .spawn();
         true
+    }
+
+    // -- tabs --------------------------------------------------------------
+
+    fn snapshot_tab(&mut self) -> TabState {
+        TabState {
+            term: std::mem::replace(&mut self.term, Term::new(80, 24)),
+            parser: std::mem::replace(&mut self.parser, vte::Parser::new()),
+            pty_writer: self.pty_writer.take(),
+            pty_master: self.pty_master.take(),
+            rx: self.rx.take(),
+            scroll: self.scroll,
+            pointer_cell: self.pointer_cell,
+            pointer_physical: self.pointer_physical,
+            last_autoscroll: self.last_autoscroll,
+            mouse_down: self.mouse_down,
+            selection: self.selection.take(),
+            selecting: self.selecting,
+            last_click: self.last_click.take(),
+            click_count: self.click_count,
+            over_link: self.over_link,
+            search: self.search.take(),
+        }
+    }
+
+    fn restore_tab(&mut self, tab: TabState) {
+        self.term = tab.term;
+        self.parser = tab.parser;
+        self.pty_writer = tab.pty_writer;
+        self.pty_master = tab.pty_master;
+        self.rx = tab.rx;
+        self.scroll = tab.scroll;
+        self.pointer_cell = tab.pointer_cell;
+        self.pointer_physical = tab.pointer_physical;
+        self.last_autoscroll = tab.last_autoscroll;
+        self.mouse_down = tab.mouse_down;
+        self.selection = tab.selection;
+        self.selecting = tab.selecting;
+        self.last_click = tab.last_click;
+        self.click_count = tab.click_count;
+        self.over_link = tab.over_link;
+        self.search = tab.search;
+    }
+
+    fn fresh_tab(&mut self) {
+        self.term = Term::new(self.term.cols.max(80), self.term.rows.max(24));
+        self.term
+            .set_theme(self.config.foreground, self.config.background, self.config.palette);
+        self.term.set_scrollback_limit(self.config.scrollback);
+        self.term.osc52_write = self.config.clipboard_write;
+        self.term.osc52_read = self.config.clipboard_read;
+        self.parser = vte::Parser::new();
+        self.pty_writer = None;
+        self.pty_master = None;
+        self.rx = None;
+        self.scroll = 0;
+        self.pointer_cell = (0, 0);
+        self.pointer_physical = None;
+        self.last_autoscroll = Instant::now();
+        self.mouse_down = None;
+        self.selection = None;
+        self.selecting = false;
+        self.last_click = None;
+        self.click_count = 0;
+        self.over_link = false;
+        self.search = None;
+    }
+
+    fn new_tab(&mut self) {
+        let current = self.snapshot_tab();
+        self.inactive_tabs.insert(self.active_tab, current);
+        self.active_tab += 1;
+        self.fresh_tab();
+        self.sync_size();
+        self.spawn_pty();
+        if let Some(text) = self.text.as_mut() {
+            text.dirty = true;
+        }
+        if self.search.is_none() {
+            self.sync_window_title();
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+
+    fn switch_tab(&mut self, delta: i32) {
+        let total = self.inactive_tabs.len() + 1;
+        if total <= 1 {
+            return;
+        }
+        let current = self.snapshot_tab();
+        self.inactive_tabs.insert(self.active_tab, current);
+        let next = (self.active_tab as i32 + delta).rem_euclid(total as i32) as usize;
+        let tab = self.inactive_tabs.remove(next);
+        self.active_tab = next.min(self.inactive_tabs.len());
+        self.restore_tab(tab);
+        self.sync_size();
+        if let Some(text) = self.text.as_mut() {
+            text.dirty = true;
+        }
+        if let Some(s) = self.search.as_mut() {
+            s.recompute(&self.term);
+            self.sync_search_title();
+        } else {
+            self.sync_window_title();
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+
+    fn close_tab(&mut self, event_loop: &ActiveEventLoop) {
+        let total = self.inactive_tabs.len() + 1;
+        if total <= 1 {
+            event_loop.exit();
+            return;
+        }
+        // Drop current PTY/session.
+        self.pty_writer = None;
+        self.pty_master = None;
+        self.rx = None;
+        let idx = self.active_tab.min(self.inactive_tabs.len().saturating_sub(1));
+        let tab = self.inactive_tabs.remove(idx);
+        self.active_tab = idx.min(self.inactive_tabs.len());
+        self.restore_tab(tab);
+        self.sync_size();
+        if let Some(text) = self.text.as_mut() {
+            text.dirty = true;
+        }
+        if let Some(s) = self.search.as_mut() {
+            s.recompute(&self.term);
+            self.sync_search_title();
+        } else {
+            self.sync_window_title();
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
     }
 
     // -- PTY ---------------------------------------------------------------
@@ -1613,7 +1777,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
-                // Ctrl+Shift+C copies selection, A copies all, F toggles search, N new window.
+                // Ctrl+Shift+C/A/F plus tab/window controls.
                 if self.modifiers.control_key() && self.modifiers.shift_key() {
                     if let Key::Character(text) = &event.logical_key {
                         if text.eq_ignore_ascii_case("c") {
@@ -1638,6 +1802,37 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             return;
                         }
+                        if text.eq_ignore_ascii_case("t") {
+                            self.new_tab();
+                            return;
+                        }
+                        if text.eq_ignore_ascii_case("w") {
+                            self.close_tab(event_loop);
+                            return;
+                        }
+                    }
+                    if matches!(event.logical_key, Key::Named(NamedKey::Tab)) {
+                        self.switch_tab(-1);
+                        return;
+                    }
+                }
+
+                // Ctrl+Tab / Ctrl+PageDown/PageUp switch tabs.
+                if self.modifiers.control_key() && !self.modifiers.shift_key() {
+                    match event.logical_key {
+                        Key::Named(NamedKey::Tab) => {
+                            self.switch_tab(1);
+                            return;
+                        }
+                        Key::Named(NamedKey::PageDown) => {
+                            self.switch_tab(1);
+                            return;
+                        }
+                        Key::Named(NamedKey::PageUp) => {
+                            self.switch_tab(-1);
+                            return;
+                        }
+                        _ => {}
                     }
                 }
 
