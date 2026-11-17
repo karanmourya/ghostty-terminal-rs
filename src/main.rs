@@ -52,6 +52,10 @@ use quad::{linear, Quad, QuadRenderer};
 
 const LINE_HEIGHT_RATIO: f32 = 1.32;
 const CURSOR_THICKNESS: f32 = 2.0;
+/// Vertical padding inside the tab bar strip.
+const TAB_BAR_PAD: f32 = 2.0;
+/// Width of one tab in monospace cells.
+const TAB_CELLS: usize = 22;
 /// Highlight colour painted behind selected cells.
 const SELECTION_BG: [u8; 3] = [0x58, 0x5e, 0x7a];
 
@@ -223,6 +227,8 @@ struct Text {
     renderer: GlyphonRenderer,
     /// One shaped buffer per visible row, so only changed rows re-shape.
     rows: Vec<RowBuffer>,
+    /// Single-line buffer holding the tab bar labels.
+    tab_buffer: Buffer,
     /// Configured font size before DPI scaling.
     base_font_size: f32,
     font_size: f32,
@@ -262,6 +268,7 @@ impl Text {
         let font_size = config.font_size * scale;
         let line_height = (font_size * LINE_HEIGHT_RATIO).round();
         let cell_width = measure_cell(&mut font_system, &family, font_size, line_height);
+        let tab_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_height));
 
         Self {
             font_system,
@@ -271,6 +278,7 @@ impl Text {
             atlas,
             renderer,
             rows: Vec::new(),
+            tab_buffer,
             base_font_size: config.font_size,
             font_size,
             family,
@@ -278,6 +286,41 @@ impl Text {
             cell_width,
             dirty: true,
         }
+    }
+
+    /// Shape the single-line tab bar. Each tab occupies `cells_per_tab`
+    /// monospace cells so labels stay aligned; a colored span marks the active one.
+    fn rebuild_tabs(&mut self, labels: &[String], active: usize, fg: [u8; 3]) {
+        use glyphon::Attrs;
+        let cells_per_tab = TAB_CELLS;
+        let width = (labels.len() * cells_per_tab * self.cell_width as usize + 64) as f32;
+        self.tab_buffer.set_size(
+            &mut self.font_system,
+            Some(width.max(256.0)),
+            Some((self.line_height + TAB_BAR_PAD * 2.0).max(1.0)),
+        );
+        let dim = [fg[0] / 2, fg[1] / 2, fg[2] / 2];
+        let spans: Vec<(String, Attrs<'static>)> = labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| {
+                let cell = if i == active { fg } else { dim };
+                let text = format!("{:<width$}", label, width = cells_per_tab);
+                (
+                    text,
+                    attrs(cell, i == active, false, false, false, &self.family),
+                )
+            })
+            .collect();
+        let default = attrs(fg, false, false, false, false, &self.family);
+        self.tab_buffer.set_rich_text(
+            &mut self.font_system,
+            spans.iter().map(|(t, a)| (t.as_str(), *a)),
+            default,
+            Shaping::Advanced,
+        );
+        self.tab_buffer
+            .shape_until_scroll(&mut self.font_system, false);
     }
 
     fn set_scale(&mut self, scale: f32) {
@@ -563,6 +606,42 @@ impl App {
         }
     }
 
+    fn tabs_len(&self) -> usize {
+        self.inactive_tabs.len() + 1
+    }
+
+    /// Height of the tab bar strip (0 when only one tab, matching Ghostty's
+    /// default of hiding it until needed).
+    fn tab_bar_h(&self) -> f32 {
+        if self.tabs_len() <= 1 {
+            return 0.0;
+        }
+        self.text
+            .as_ref()
+            .map(|t| t.line_height + TAB_BAR_PAD * 2.0)
+            .unwrap_or(0.0)
+    }
+
+    fn tab_labels(&self) -> Vec<String> {
+        let mut labels = Vec::with_capacity(self.tabs_len());
+        let all: Vec<&Term> = std::iter::once(&self.term)
+            .chain(self.inactive_tabs.iter().map(|t| &t.term))
+            .collect();
+        for (i, term) in all.into_iter().enumerate() {
+            let base = term
+                .title
+                .as_deref()
+                .or(term.cwd.as_deref())
+                .and_then(|p| p.rsplit(['/', '\\']).next())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("shell");
+            let max = TAB_CELLS - 5;
+            let short: String = base.chars().take(max).collect();
+            labels.push(format!("{}{} ", i + 1, short));
+        }
+        labels
+    }
+
     // -- search -------------------------------------------------------------
 
     fn search_open(&mut self) {
@@ -713,8 +792,14 @@ impl App {
         let Some(text) = self.text.as_ref() else {
             return (80, 24);
         };
+        let bar_h = if self.tabs_len() > 1 {
+            text.line_height + TAB_BAR_PAD * 2.0
+        } else {
+            0.0
+        };
         let usable_w = (self.width as f32 - self.config.padding * 2.0).max(text.cell_width);
-        let usable_h = (self.height as f32 - self.config.padding * 2.0).max(text.line_height);
+        let usable_h =
+            (self.height as f32 - self.config.padding * 2.0 - bar_h).max(text.line_height);
         (
             (usable_w / text.cell_width).floor() as usize,
             (usable_h / text.line_height).floor() as usize,
@@ -779,7 +864,8 @@ impl App {
         let col = ((x as f32 - self.config.padding) / text.cell_width)
             .floor()
             .max(0.0) as usize;
-        let row = ((y as f32 - self.config.padding) / text.line_height).floor() as i32;
+        let row =
+            ((y as f32 - self.config.padding - self.tab_bar_h()) / text.line_height).floor() as i32;
         (col.min(self.term.cols.saturating_sub(1)), row)
     }
 
@@ -937,9 +1023,10 @@ impl App {
         let Some(text) = self.text.as_ref() else {
             return false;
         };
-        let top_edge = self.config.padding as f64;
-        let bottom_edge =
-            self.config.padding as f64 + self.term.rows as f64 * text.line_height as f64;
+        let top_edge = self.config.padding as f64 + self.tab_bar_h() as f64;
+        let bottom_edge = self.config.padding as f64
+            + self.tab_bar_h() as f64
+            + self.term.rows as f64 * text.line_height as f64;
         let (col, _) = self.cell_at_signed(px, y);
         if y < top_edge {
             // Dragging above the window: reveal older lines.
@@ -1106,6 +1193,48 @@ impl App {
             self.sync_search_title();
         } else {
             self.sync_window_title();
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+
+    fn activate_tab(&mut self, target: usize) {
+        let total = self.tabs_len();
+        if target >= total || target == self.active_tab {
+            return;
+        }
+        let current = self.snapshot_tab();
+        self.inactive_tabs.insert(self.active_tab, current);
+        let tab = self.inactive_tabs.remove(target);
+        self.active_tab = target.min(self.inactive_tabs.len());
+        self.restore_tab(tab);
+        self.sync_size();
+        if let Some(text) = self.text.as_mut() {
+            text.dirty = true;
+        }
+        if let Some(s) = self.search.as_mut() {
+            s.recompute(&self.term);
+            self.sync_search_title();
+        } else {
+            self.sync_window_title();
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+
+    fn close_tab_at(&mut self, index: usize, event_loop: &ActiveEventLoop) {
+        if index == self.active_tab {
+            self.close_tab(event_loop);
+        } else if index < self.active_tab {
+            self.inactive_tabs.remove(index);
+            self.active_tab -= 1;
+        } else if index > self.active_tab && index <= self.inactive_tabs.len() {
+            self.inactive_tabs.remove(index - 1);
+        }
+        if let Some(text) = self.text.as_mut() {
+            text.dirty = true;
         }
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
@@ -1366,6 +1495,11 @@ impl App {
     // -- rendering ---------------------------------------------------------
 
     fn render(&mut self) {
+        // Compute whole-self views before borrowing individual fields mutably.
+        let bar_h = self.tab_bar_h();
+        let labels = self.tab_labels();
+        let active_tab = self.active_tab;
+        let fg = self.term.foreground();
         let (Some(gpu), Some(text), Some(quads), Some(window)) = (
             self.gpu.as_ref(),
             self.text.as_mut(),
@@ -1385,6 +1519,10 @@ impl App {
         let cell_w = text.cell_width;
         let line_h = text.line_height;
         let padding = self.config.padding;
+        let y0 = padding + bar_h;
+
+        // Shape the tab bar labels whenever the tab set changes.
+        text.rebuild_tabs(&labels, active_tab, fg);
 
         if text.dirty {
             text.rebuild(&self.term, self.scroll, surface_width, surface_height);
@@ -1403,7 +1541,7 @@ impl App {
                     instances.push(Quad {
                         rect: [
                             padding + x as f32 * cell_w,
-                            padding + y as f32 * line_h,
+                            y0 + y as f32 * line_h,
                             cell_w,
                             line_h,
                         ],
@@ -1415,7 +1553,7 @@ impl App {
                     instances.push(Quad {
                         rect: [
                             padding + x as f32 * cell_w,
-                            padding + y as f32 * line_h + line_h - 2.5,
+                            y0 + y as f32 * line_h + line_h - 2.5,
                             cell_w,
                             1.5,
                         ],
@@ -1426,7 +1564,7 @@ impl App {
                     instances.push(Quad {
                         rect: [
                             padding + x as f32 * cell_w,
-                            padding + y as f32 * line_h + (line_h * 0.55),
+                            y0 + y as f32 * line_h + (line_h * 0.55),
                             cell_w,
                             1.5,
                         ],
@@ -1446,7 +1584,7 @@ impl App {
                         instances.push(Quad {
                             rect: [
                                 padding + first as f32 * cell_w,
-                                padding + y as f32 * line_h,
+                                y0 + y as f32 * line_h,
                                 (last - first + 1) as f32 * cell_w,
                                 line_h,
                             ],
@@ -1481,13 +1619,34 @@ impl App {
                 instances.push(Quad {
                     rect: [
                         padding + first as f32 * cell_w,
-                        padding + y as f32 * line_h,
+                        y0 + y as f32 * line_h,
                         (last - first + 1) as f32 * cell_w,
                         line_h,
                     ],
                     color,
                 });
             }
+        }
+        // --- tab bar strip (drawn behind text) ---
+        if bar_h > 0.0 {
+            let tab_w = TAB_CELLS as f32 * cell_w;
+            let strip = [
+                (self.term.background(), 1.0),
+                (self.term.foreground(), 0.10),
+            ];
+            instances.push(Quad {
+                rect: [0.0, 0.0, surface_width, bar_h],
+                color: linear(strip[0].0, strip[0].1),
+            });
+            let ax = padding + active_tab as f32 * tab_w;
+            instances.push(Quad {
+                rect: [ax, 0.0, tab_w, bar_h],
+                color: linear(strip[1].0, strip[1].1),
+            });
+            instances.push(Quad {
+                rect: [0.0, bar_h - 1.0, surface_width, 1.0],
+                color: linear(self.term.foreground(), 0.25),
+            });
         }
         let bg_count = instances.len() as u32;
 
@@ -1497,7 +1656,7 @@ impl App {
         if history > 0 && self.scroll > 0 {
             let track_x = surface_width - padding - 4.0;
             let track_h = rows as f32 * line_h;
-            let track_y = padding;
+            let track_y = y0;
             instances.push(Quad {
                 rect: [track_x, track_y, 4.0, track_h],
                 color: linear(self.term.foreground(), 0.10),
@@ -1516,7 +1675,7 @@ impl App {
         if cursor_visible {
             let (cx, cy) = self.term.cursor();
             let x = padding + cx as f32 * cell_w;
-            let y = padding + cy as f32 * line_h;
+            let y = y0 + cy as f32 * line_h;
             let color = linear(self.term.foreground(), 0.9);
             let t = CURSOR_THICKNESS;
             match self.config.cursor_style {
@@ -1571,14 +1730,14 @@ impl App {
             self.term.foreground()[2],
         );
         // One TextArea per row: rows keep their shaped buffers between frames.
-        let areas: Vec<TextArea> = text
+        let mut areas: Vec<TextArea> = text
             .rows
             .iter()
             .enumerate()
             .map(|(y, row)| TextArea {
                 buffer: &row.buffer,
                 left: padding,
-                top: padding + y as f32 * text.line_height,
+                top: y0 + y as f32 * text.line_height,
                 scale: 1.0,
                 bounds: TextBounds {
                     left: 0,
@@ -1590,6 +1749,22 @@ impl App {
                 custom_glyphs: &[],
             })
             .collect();
+        if bar_h > 0.0 {
+            areas.push(TextArea {
+                buffer: &text.tab_buffer,
+                left: padding,
+                top: 0.0,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: 0,
+                    top: 0,
+                    right: gpu.config.width as i32,
+                    bottom: bar_h as i32,
+                },
+                default_color,
+                custom_glyphs: &[],
+            });
+        }
         let prepared = text.renderer.prepare(
             &gpu.device,
             &gpu.queue,
@@ -1965,6 +2140,23 @@ impl ApplicationHandler<UserEvent> for App {
                 // the local override for selecting text.
                 let reports =
                     self.term.mouse_mode() != term::MouseMode::Off && !self.modifiers.shift_key();
+                // Clicks on the tab bar select a tab; middle-click closes one.
+                let bar_h = self.tab_bar_h();
+                if let (ElementState::Pressed, Some((px, py))) = (&state, self.pointer_physical) {
+                    if bar_h > 0.0 && py < bar_h as f64 {
+                        let cell_w = self.text.as_ref().map(|t| t.cell_width).unwrap_or(10.0);
+                        let tab_w = TAB_CELLS as f64 * cell_w as f64;
+                        let idx = ((px - self.config.padding as f64) / tab_w).floor() as isize;
+                        if idx >= 0 && (idx as usize) < self.tabs_len() {
+                            if code == 1 {
+                                self.close_tab_at(idx as usize, event_loop);
+                            } else if code == 0 {
+                                self.activate_tab(idx as usize);
+                            }
+                        }
+                        return;
+                    }
+                }
                 match state {
                     ElementState::Pressed => {
                         self.mouse_down = Some(code);
