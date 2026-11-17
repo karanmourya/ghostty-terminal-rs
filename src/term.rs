@@ -4,7 +4,7 @@
 //! it owns the screen grid and implements `vte::Perform` so the `vte` crate
 //! can drive it with parsed escape sequences.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use unicode_width::UnicodeWidthChar;
 use vte::{Params, Perform};
@@ -34,6 +34,42 @@ pub const PALETTE: [[u8; 3]; 16] = [
     [0x55, 0xff, 0xff],
     [0xff, 0xff, 0xff],
 ];
+
+/// A decoded kitty graphics image. RGBA pixels, straight (non-premultiplied) alpha.
+#[derive(Clone, Debug)]
+pub struct KittyImage {
+    pub id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// Where a kitty image is drawn: a rectangle anchored in the grid, expressed
+/// in cell units relative to the cursor at placement time.
+#[derive(Clone, Debug)]
+pub struct KittyPlacement {
+    #[allow(dead_code)]
+    pub id: u32,
+    pub image_id: u32,
+    /// Absolute line (scrollback + screen) of the top edge.
+    pub line: usize,
+    /// Column of the left edge.
+    pub col: usize,
+    /// Size in cells.
+    pub cols: usize,
+    pub rows: usize,
+    /// Draw order; negative z draws behind text.
+    pub z: i32,
+}
+
+/// Pending APC (`ESC _ ... ST`) collection state, persistent across `feed` calls
+/// so a sequence split across PTY chunks still parses.
+#[derive(Debug)]
+enum ApcState {
+    None,
+    Esc,
+    Collect(Vec<u8>),
+}
 
 /// A single grid cell.
 ///
@@ -180,6 +216,17 @@ pub struct Term {
     links: Vec<String>,
     /// Hyperlink attached to newly written cells (0 = none).
     current_link: u16,
+    /// Kitty graphics: decoded images and their grid placements.
+    kitty_images: HashMap<u32, KittyImage>,
+    kitty_placements: Vec<KittyPlacement>,
+    /// Multi-part transmissions in progress (image id -> accumulated base64).
+    kitty_chunks: HashMap<u32, (String, String)>,
+    /// Bumped whenever an image is added or removed, so the GPU side can sync.
+    pub kitty_version: u64,
+    /// APC collection state for kitty graphics.
+    apc_state: ApcState,
+    /// DCS kitty payload being collected via `Perform::put`.
+    dcs_kitty: Option<Vec<u8>>,
     responses: Vec<Vec<u8>>,
     dirty: bool,
 }
@@ -233,6 +280,12 @@ impl Term {
             sync_started: None,
             links: Vec::new(),
             current_link: 0,
+            kitty_images: HashMap::new(),
+            kitty_placements: Vec::new(),
+            kitty_chunks: HashMap::new(),
+            kitty_version: 0,
+            apc_state: ApcState::None,
+            dcs_kitty: None,
             responses: Vec::new(),
             dirty: true,
         }
@@ -328,14 +381,167 @@ impl Term {
 
     /// Feed raw PTY bytes through the parser.
     pub fn feed(&mut self, parser: &mut vte::Parser, bytes: &[u8]) {
-        for &b in bytes {
-            parser.advance(self, b);
+        // vte 0.11 swallows APC (`ESC _ ... ST`) payloads, so intercept them
+        // here for the kitty graphics protocol. Everything else goes to vte.
+        // The state is taken out of `self` so `handle_kitty` can borrow freely.
+        let mut apc = std::mem::replace(&mut self.apc_state, ApcState::None);
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            match apc {
+                ApcState::None => {
+                    if b == 0x1b {
+                        apc = ApcState::Esc;
+                    } else {
+                        parser.advance(self, b);
+                    }
+                    i += 1;
+                }
+                ApcState::Esc => {
+                    if b == b'_' {
+                        apc = ApcState::Collect(Vec::new());
+                    } else {
+                        // Not APC: replay ESC + byte through vte unchanged.
+                        parser.advance(self, 0x1b);
+                        parser.advance(self, b);
+                        apc = ApcState::None;
+                    }
+                    i += 1;
+                }
+                ApcState::Collect(ref mut buf) => {
+                    // String terminator: ESC \ or BEL.
+                    if b == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                        let payload = std::mem::take(buf);
+                        self.handle_kitty(&payload);
+                        apc = ApcState::None;
+                        i += 2;
+                        continue;
+                    }
+                    if b == 0x07 {
+                        let payload = std::mem::take(buf);
+                        self.handle_kitty(&payload);
+                        apc = ApcState::None;
+                        i += 1;
+                        continue;
+                    }
+                    buf.push(b);
+                    i += 1;
+                }
+            }
         }
+        self.apc_state = apc;
         // ?2026 synchronized output: parse everything, paint nothing until
         // the app clears the mode.
         if !self.sync_output {
             self.dirty = true;
         }
+    }
+
+    /// Parse a kitty graphics payload (from APC or DCS) and update images/placements.
+    fn handle_kitty(&mut self, payload: &[u8]) {
+        let owned = String::from_utf8_lossy(payload).into_owned();
+        // APC payloads include the `G` introducer; DCS payloads do not.
+        let text = owned.strip_prefix('G').unwrap_or(&owned);
+        let (control, inline_data) = match text.split_once(';') {
+            Some((c, d)) => (c, Some(d)),
+            None => (text, None),
+        };
+        let mut id = 0u32;
+        let mut action = 'T';
+        let mut more = false;
+        let mut inline_b64: Option<&str> = None;
+        let mut delete_all = false;
+        let mut cols = 0usize;
+        let mut rows = 0usize;
+        let mut xoff = 0i64;
+        let mut yoff = 0i64;
+        let mut z = 0i32;
+        for item in control.split(',') {
+            let Some((k, v)) = item.split_once('=') else {
+                continue;
+            };
+            match k {
+                "a" => action = v.chars().next().unwrap_or('T'),
+                "i" => id = v.parse().unwrap_or(0),
+                "m" => more = v == "1",
+                "d" => {
+                    if v == "a" {
+                        delete_all = true;
+                    } else {
+                        inline_b64 = Some(v);
+                    }
+                }
+                "c" => cols = v.parse().unwrap_or(0),
+                "r" => rows = v.parse().unwrap_or(0),
+                "C" => xoff = v.parse().unwrap_or(0),
+                "R" => yoff = v.parse().unwrap_or(0),
+                "z" => z = v.parse().unwrap_or(0),
+                _ => {}
+            }
+        }
+        match action {
+            'T' => {
+                let data = inline_b64.or(inline_data).unwrap_or("");
+                if more {
+                    let entry = self
+                        .kitty_chunks
+                        .entry(id)
+                        .or_insert_with(|| (control.to_string(), String::new()));
+                    entry.1.push_str(data);
+                } else {
+                    let (params, mut b64) = self
+                        .kitty_chunks
+                        .remove(&id)
+                        .unwrap_or_else(|| (control.to_string(), String::new()));
+                    b64.push_str(data);
+                    if let Some(mut img) = decode_kitty_image(&params, &b64) {
+                        img.id = id;
+                        self.kitty_images.insert(id, img);
+                        self.kitty_version = self.kitty_version.wrapping_add(1);
+                        self.dirty = true;
+                    }
+                }
+            }
+            'p' => {
+                if self.kitty_images.contains_key(&id) {
+                    let line = (self.scrollback_len() + self.cy) as i64 + yoff;
+                    let col = self.cx as i64 + xoff;
+                    self.kitty_placements.push(KittyPlacement {
+                        id: (self.kitty_placements.len() + 1) as u32,
+                        image_id: id,
+                        line: line.max(0) as usize,
+                        col: col.max(0) as usize,
+                        cols: cols.max(1),
+                        rows: rows.max(1),
+                        z,
+                    });
+                    self.dirty = true;
+                }
+            }
+            'd' => {
+                if delete_all {
+                    self.kitty_placements.clear();
+                    self.kitty_images.clear();
+                    self.kitty_chunks.clear();
+                } else {
+                    self.kitty_placements.retain(|p| p.image_id != id);
+                    self.kitty_images.remove(&id);
+                    self.kitty_chunks.remove(&id);
+                }
+                self.kitty_version = self.kitty_version.wrapping_add(1);
+                self.dirty = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// Decoded kitty images, for the GPU side to upload as textures.
+    pub fn kitty_images(&self) -> impl Iterator<Item = &KittyImage> {
+        self.kitty_images.values()
+    }
+
+    pub fn kitty_placements(&self) -> &[KittyPlacement] {
+        &self.kitty_placements
     }
 
     /// Safety valve: an app that never clears `?2026` must not freeze the
@@ -903,6 +1109,26 @@ impl Perform for Term {
         self.put_char(c);
     }
 
+    // DCS form of kitty graphics (`ESC P G ... ST`). The APC form is
+    // intercepted in `feed` because vte 0.11 does not surface APC payloads.
+    fn hook(&mut self, _params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
+        if action == 'G' && intermediates.is_empty() {
+            self.dcs_kitty = Some(Vec::new());
+        }
+    }
+
+    fn put(&mut self, byte: u8) {
+        if let Some(buf) = self.dcs_kitty.as_mut() {
+            buf.push(byte);
+        }
+    }
+
+    fn unhook(&mut self) {
+        if let Some(buf) = self.dcs_kitty.take() {
+            self.handle_kitty(&buf);
+        }
+    }
+
     fn execute(&mut self, byte: u8) {
         match byte {
             b'\n' | 0x0b | 0x0c => self.linefeed(),
@@ -1100,6 +1326,10 @@ impl Perform for Term {
                 self.cwd = None;
                 self.notifications.clear();
                 self.prompt_state = None;
+                self.kitty_placements.clear();
+                self.kitty_images.clear();
+                self.kitty_chunks.clear();
+                self.kitty_version = self.kitty_version.wrapping_add(1);
                 self.reset_pen();
             }
             b'D' => self.linefeed(),
@@ -1240,6 +1470,45 @@ fn parse_osc7_path(uri: &str) -> String {
     } else {
         path.to_string()
     }
+}
+
+/// Decode a kitty graphics transmission into RGBA pixels.
+/// `f=100` (or omitted) is PNG; `f=32` is raw RGBA with `w`/`h` keys.
+fn decode_kitty_image(params: &str, b64: &str) -> Option<KittyImage> {
+    let mut format = 100u32;
+    let mut w = 0u32;
+    let mut h = 0u32;
+    for item in params.split(',') {
+        let Some((k, v)) = item.split_once('=') else {
+            continue;
+        };
+        match k {
+            "f" => format = v.parse().unwrap_or(100),
+            "w" => w = v.parse().unwrap_or(0),
+            "h" => h = v.parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    let bytes = base64_decode(b64.as_bytes())?;
+    let rgba_image = match format {
+        100 | 0 => image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+            .ok()?
+            .to_rgba8(),
+        32 => {
+            if w == 0 || h == 0 {
+                return None;
+            }
+            image::RgbaImage::from_raw(w, h, bytes)?
+        }
+        _ => return None,
+    };
+    let (width, height) = rgba_image.dimensions();
+    Some(KittyImage {
+        id: 0,
+        width,
+        height,
+        rgba: rgba_image.into_raw(),
+    })
 }
 
 /// Decode the base64 payload of an OSC 52 sequence into clipboard text.
@@ -1771,6 +2040,53 @@ mod tests {
         assert_eq!(t.prompt_state, Some('A'));
         feed(&mut t, "\x1b]133;B\x07");
         assert_eq!(t.prompt_state, Some('B'));
+    }
+
+    #[test]
+    fn kitty_apc_transmit_and_place() {
+        // 2x2 red PNG.
+        let mut png = Vec::new();
+        image::RgbaImage::from_raw(
+            2,
+            2,
+            vec![
+                255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+            ],
+        )
+        .unwrap()
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+        let b64 = base64_encode(&png);
+        let mut t = Term::new(20, 5);
+        // APC transmit then place at the cursor, 3 cols x 2 rows.
+        feed(
+            &mut t,
+            &format!("\x1b_Ga=T,f=100,i=7,d={b64}\x1b\\\x1b_Ga=p,i=7,c=3,r=2\x1b\\"),
+        );
+        assert_eq!(t.kitty_images().count(), 1);
+        let img = t.kitty_images().next().unwrap();
+        assert_eq!((img.id, img.width, img.height), (7, 2, 2));
+        assert_eq!(img.rgba.len(), 16);
+        assert_eq!(t.kitty_placements().len(), 1);
+        let p = &t.kitty_placements()[0];
+        assert_eq!((p.image_id, p.cols, p.rows, p.z), (7, 3, 2, 0));
+        // Delete removes the image and its placements.
+        feed(&mut t, "\x1b_Ga=d,i=7\x1b\\");
+        assert_eq!(t.kitty_images().count(), 0);
+        assert!(t.kitty_placements().is_empty());
+    }
+
+    #[test]
+    fn kitty_dcs_transmit() {
+        let mut png = Vec::new();
+        image::RgbaImage::from_raw(1, 1, vec![0, 255, 0, 255])
+            .unwrap()
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let b64 = base64_encode(&png);
+        let mut t = Term::new(20, 5);
+        feed(&mut t, &format!("\x1bPGa=T,f=100,i=9,d={b64}\x1b\\"));
+        assert!(t.kitty_images().any(|i| i.id == 9));
     }
 
     #[test]

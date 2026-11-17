@@ -16,6 +16,7 @@
 //! before it can be called a Ghostty replacement.
 
 mod config;
+mod image_render;
 mod quad;
 mod term;
 
@@ -48,6 +49,7 @@ use winit::{
     window::{CursorIcon, Window, WindowId},
 };
 
+use image_render::ImageRenderer;
 use quad::{linear, Quad, QuadRenderer};
 
 const LINE_HEIGHT_RATIO: f32 = 1.32;
@@ -515,6 +517,7 @@ struct App {
     gpu: Option<Gpu>,
     text: Option<Text>,
     quads: Option<QuadRenderer>,
+    images: Option<ImageRenderer>,
     window: Option<Arc<Window>>,
     proxy: Option<EventLoopProxy<UserEvent>>,
 
@@ -578,6 +581,7 @@ impl App {
             gpu: None,
             text: None,
             quads: None,
+            images: None,
             window: None,
             proxy: None,
             term,
@@ -1500,10 +1504,14 @@ impl App {
         let labels = self.tab_labels();
         let active_tab = self.active_tab;
         let fg = self.term.foreground();
-        let (Some(gpu), Some(text), Some(quads), Some(window)) = (
+        let kitty_images: Vec<&term::KittyImage> = self.term.kitty_images().collect();
+        let kitty_placements = self.term.kitty_placements().to_vec();
+        let kitty_version = self.term.kitty_version;
+        let (Some(gpu), Some(text), Some(quads), Some(images), Some(window)) = (
             self.gpu.as_ref(),
             self.text.as_mut(),
             self.quads.as_mut(),
+            self.images.as_mut(),
             self.window.as_ref(),
         ) else {
             return;
@@ -1716,6 +1724,32 @@ impl App {
             &instances,
         );
 
+        // Kitty images: upload new textures, then lay out visible placements
+        // behind the text. Sorted by z so draw order follows kitty's stacking.
+        images.begin(
+            &gpu.device,
+            &gpu.queue,
+            [surface_width, surface_height],
+            kitty_version,
+            &kitty_images,
+        );
+        let mut placed: Vec<_> = kitty_placements
+            .iter()
+            .filter(|p| p.line >= top && p.line < top + rows)
+            .collect();
+        placed.sort_by_key(|p| p.z);
+        for p in placed {
+            images.push(
+                &gpu.device,
+                p.image_id,
+                padding + p.col as f32 * cell_w,
+                y0 + (p.line - top) as f32 * line_h,
+                p.cols as f32 * cell_w,
+                p.rows as f32 * line_h,
+            );
+        }
+        images.upload(&gpu.queue);
+
         text.viewport.update(
             &gpu.queue,
             Resolution {
@@ -1822,6 +1856,7 @@ impl App {
             });
 
             quads.draw_range(&mut pass, 0..bg_count);
+            images.draw(&mut pass);
             if let Err(err) = text.renderer.render(&text.atlas, &text.viewport, &mut pass) {
                 eprintln!("glyphon render failed: {err:?}");
             }
@@ -1856,6 +1891,7 @@ impl ApplicationHandler<UserEvent> for App {
         let config = self.config.clone();
         let text = Text::new(&gpu, scale, &config);
         let quads = QuadRenderer::new(&gpu.device, gpu.config.format);
+        let images = ImageRenderer::new(&gpu.device, gpu.config.format);
 
         self.width = gpu.config.width;
         self.height = gpu.config.height;
@@ -1863,6 +1899,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.gpu = Some(gpu);
         self.text = Some(text);
         self.quads = Some(quads);
+        self.images = Some(images);
         self.window = Some(window);
 
         self.sync_size();

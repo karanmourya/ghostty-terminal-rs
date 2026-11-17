@@ -116,14 +116,20 @@ with `clipboard-write = false` / `clipboard-read = false` in the config file.
 - **Ctrl+Shift+T**: new tab (separate shell session). **Ctrl+Shift+W**: close tab (closes window on last tab).
 - **Ctrl+Tab** / **Ctrl+PageDown**: next tab. **Ctrl+Shift+Tab** / **Ctrl+PageUp**: previous tab.
 - **Ctrl+Shift+N**: open a new window (new process).
-- `--server`: runs a minimal daemon on `127.0.0.1:17865` that spawns windows on request. `--new-window`: asks a running server to open a window.
-- When multiple tabs are open, the active tab index is shown in the window title (e.g. `[2/3]`). No visual tab bar or in-window splits yet.
+- A **visual tab bar** appears once a second tab exists: click a tab to switch, middle-click to close. With one tab it is hidden.
+- `--server`: minimal line-based daemon on `127.0.0.1:17865` — `PING`, `NEW_WINDOW [shell]`, `WINDOWS`, `QUIT`. `--new-window` asks it to spawn a window; `--send <command>` sends any command and prints the reply.
+
+## Kitty graphics
+
+The kitty graphics protocol is implemented: `a=T` transmit (`f=100` PNG / `f=32` RGBA, including multi-part `m=1` chunks), `a=p` place (cursor-relative `C`/`R`, `c`/`r` cell size, `z` stacking), and `a=d` delete — over both APC (`ESC _ G`) and DCS (`ESC P G`) forms. Images are decoded and uploaded as GPU textures, then drawn as quads behind the text.
+
+**Windows limitation:** ConPTY (the Windows pseudo-terminal backend) consumes APC/DCS string sequences and does not forward them to the terminal, so kitty graphics cannot be driven through a ConPTY-backed shell here. The parser and renderer are unit-tested (`kitty_apc_transmit_and_place`, `kitty_dcs_transmit`); end-to-end display needs a PTY backend that forwards APC/DCS.
 
 ## What is missing (the honest list)
 
-- Visual in-window tab bar and pane splits (layout manager).
-- Full server/daemon protocol (current mode is a minimal local window-spawn server).
-- Kitty graphics rendering (APC image sequences are consumed by the parser but not decoded/displayed).
+- In-window pane splits (layout manager).
+- Kitty graphics end-to-end through ConPTY (blocked by Windows ConPTY, see above).
+- Full daemon/session protocol (the current daemon only spawns windows).
 
 ## Architecture
 

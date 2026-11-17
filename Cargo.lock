@@ -684,6 +684,7 @@ dependencies = [
  "arboard",
  "bytemuck",
  "glyphon",
+ "image",
  "pollster",
  "portable-pty",
  "unicode-width 0.2.3",

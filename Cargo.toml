@@ -23,6 +23,8 @@ unicode-width = "0.2"
 bytemuck = { version = "1", features = ["derive"] }
 # Clipboard (Ctrl+V paste).
 arboard = "3"
+# Kitty graphics protocol: PNG decoding for transmitted images.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [profile.release]
 lto = true
