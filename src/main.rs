@@ -2346,42 +2346,77 @@ fn mouse_button_code(button: MouseButton) -> Option<u8> {
     }
 }
 
+const SERVER_ADDR: &str = "127.0.0.1:17865";
+
+/// Minimal line-based daemon protocol (all commands newline-terminated):
+///   PING                 -> PONG
+///   NEW_WINDOW [shell]   -> OK   (spawns a GUI window, optionally with a shell line)
+///   WINDOWS              -> <count>
+///   QUIT                 -> OK   (stops the server)
 fn server_loop() {
-    use std::io::{Read, Write};
+    use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
-    let listener = match TcpListener::bind("127.0.0.1:17865") {
+    let listener = match TcpListener::bind(SERVER_ADDR) {
         Ok(l) => l,
         Err(err) => {
-            eprintln!("ghostty-windows --server: failed to bind 127.0.0.1:17865: {err}");
+            eprintln!("ghostty-windows --server: failed to bind {SERVER_ADDR}: {err}");
             return;
         }
     };
-    eprintln!("ghostty-windows server listening on 127.0.0.1:17865");
+    eprintln!("ghostty-windows server listening on {SERVER_ADDR}");
+    let mut windows = 0usize;
     for stream in listener.incoming() {
-        let Ok(mut stream) = stream else { continue };
-        let mut buf = [0u8; 16];
-        let _ = stream.read(&mut buf);
-        if buf.first().copied() == Some(b'n') || buf.first().copied() == Some(b'N') {
-            if let Ok(exe) = std::env::current_exe() {
-                let _ = std::process::Command::new(exe).spawn();
-            }
-            let _ = stream.write_all(b"ok");
+        let Ok(stream) = stream else { continue };
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        if reader.read_line(&mut line).is_err() {
+            continue;
         }
+        let line = line.trim_end_matches(['\r', '\n']);
+        let (cmd, arg) = line.split_once(' ').unwrap_or((line, ""));
+        let reply = match cmd {
+            "PING" => "PONG".to_string(),
+            "WINDOWS" => windows.to_string(),
+            "NEW_WINDOW" => {
+                if let Ok(exe) = std::env::current_exe() {
+                    let mut process = std::process::Command::new(exe);
+                    if !arg.is_empty() {
+                        process.env("GHOSTTY_WIN_SHELL", arg);
+                    }
+                    if process.spawn().is_ok() {
+                        windows += 1;
+                        "OK".to_string()
+                    } else {
+                        "ERR spawn failed".to_string()
+                    }
+                } else {
+                    "ERR no exe".to_string()
+                }
+            }
+            "QUIT" => {
+                let _ = reader.get_mut().write_all(b"OK\n");
+                break;
+            }
+            _ => "ERR unknown command".to_string(),
+        };
+        let _ = reader.get_mut().write_all(format!("{reply}\n").as_bytes());
     }
 }
 
-fn try_new_window_via_server() -> bool {
-    use std::io::{Read, Write};
+/// Ask a running server to run a command; returns its reply, or `None` when no
+/// server is listening.
+fn server_command(command: &str) -> Option<String> {
+    use std::io::{BufRead, BufReader, Write};
     use std::net::TcpStream;
-    let Ok(mut stream) = TcpStream::connect("127.0.0.1:17865") else {
-        return false;
-    };
-    if stream.write_all(b"n").is_err() {
-        return false;
-    }
-    let mut buf = [0u8; 8];
-    let _ = stream.read(&mut buf);
-    true
+    let mut stream = TcpStream::connect(SERVER_ADDR).ok()?;
+    stream.write_all(format!("{command}\n").as_bytes()).ok()?;
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply).ok()?;
+    Some(reply.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn try_new_window_via_server() -> bool {
+    server_command("NEW_WINDOW").as_deref() == Some("OK")
 }
 
 fn main() {
@@ -2392,6 +2427,21 @@ fn main() {
     }
     if args.iter().any(|a| a == "--new-window") && try_new_window_via_server() {
         return;
+    }
+    // Arbitrary daemon command, e.g. `--send PING` or `--send "NEW_WINDOW pwsh.exe"`.
+    if let Some(i) = args.iter().position(|a| a == "--send") {
+        if let Some(cmd) = args.get(i + 1) {
+            match server_command(cmd) {
+                Some(reply) => {
+                    println!("{reply}");
+                    return;
+                }
+                None => {
+                    eprintln!("no ghostty-windows server on {SERVER_ADDR}");
+                    return;
+                }
+            }
+        }
     }
 
     let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
