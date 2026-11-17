@@ -513,9 +513,38 @@ struct TabState {
     search: Option<SearchState>,
 }
 
+impl TabState {
+    fn new(config: &Config) -> Self {
+        let mut term = Term::new(80, 24);
+        term.set_theme(config.foreground, config.background, config.palette);
+        term.set_scrollback_limit(config.scrollback);
+        term.osc52_write = config.clipboard_write;
+        term.osc52_read = config.clipboard_read;
+        Self {
+            term,
+            parser: vte::Parser::new(),
+            pty_writer: None,
+            pty_master: None,
+            rx: None,
+            scroll: 0,
+            pointer_cell: (0, 0),
+            pointer_physical: None,
+            last_autoscroll: Instant::now(),
+            mouse_down: None,
+            selection: None,
+            selecting: false,
+            last_click: None,
+            click_count: 0,
+            over_link: false,
+            search: None,
+        }
+    }
+}
+
 struct App {
     gpu: Option<Gpu>,
     text: Option<Text>,
+    text2: Option<Text>,
     quads: Option<QuadRenderer>,
     images: Option<ImageRenderer>,
     window: Option<Arc<Window>>,
@@ -555,6 +584,11 @@ struct App {
     inactive_tabs: Vec<TabState>,
     active_tab: usize,
 
+    /// Optional second side-by-side pane, with its own shell/term state.
+    split: Option<Box<TabState>>,
+    /// Which pane receives input: false = primary, true = split.
+    focus_pane: bool,
+
     modifiers: ModifiersState,
     width: u32,
     height: u32,
@@ -580,6 +614,7 @@ impl App {
         Self {
             gpu: None,
             text: None,
+            text2: None,
             quads: None,
             images: None,
             window: None,
@@ -603,10 +638,21 @@ impl App {
             search: None,
             inactive_tabs: Vec::new(),
             active_tab: 0,
+            split: None,
+            focus_pane: false,
             modifiers: ModifiersState::empty(),
             width: 1000,
             height: 640,
             scale: 1.0,
+        }
+    }
+
+    /// The term belonging to the currently focused pane.
+    fn active_term(&self) -> &Term {
+        if self.focus_pane {
+            self.split.as_ref().map(|s| &s.term).unwrap_or(&self.term)
+        } else {
+            &self.term
         }
     }
 
@@ -811,23 +857,50 @@ impl App {
     }
 
     fn sync_size(&mut self) {
-        let (cols, rows) = self.dimensions();
-        if cols == self.term.cols && rows == self.term.rows {
-            return;
+        let (full_cols, rows) = self.dimensions();
+        let cols = if self.split.is_some() {
+            (full_cols / 2).saturating_sub(1).max(1)
+        } else {
+            full_cols
+        };
+        let mut changed = false;
+        if cols != self.term.cols || rows != self.term.rows {
+            self.term.resize(cols, rows);
+            if let Some(master) = self.pty_master.as_ref() {
+                let _ = master.resize(PtySize {
+                    rows: rows as u16,
+                    cols: cols as u16,
+                    pixel_width: (self.width as usize / if self.split.is_some() { 2 } else { 1 })
+                        as u16,
+                    pixel_height: self.height as u16,
+                });
+            }
+            self.scroll = self.scroll.min(self.term.scrollback_len());
+            changed = true;
         }
-        self.term.resize(cols, rows);
-        if let Some(master) = self.pty_master.as_ref() {
-            let _ = master.resize(PtySize {
-                rows: rows as u16,
-                cols: cols as u16,
-                pixel_width: self.width as u16,
-                pixel_height: self.height as u16,
-            });
+        if let Some(split) = self.split.as_mut() {
+            if split.term.cols != cols || split.term.rows != rows {
+                split.term.resize(cols, rows);
+                if let Some(master) = split.pty_master.as_ref() {
+                    let _ = master.resize(PtySize {
+                        rows: rows as u16,
+                        cols: cols as u16,
+                        pixel_width: (self.width as usize / 2) as u16,
+                        pixel_height: self.height as u16,
+                    });
+                }
+                split.scroll = split.scroll.min(split.term.scrollback_len());
+                changed = true;
+            }
         }
-        if let Some(text) = self.text.as_mut() {
-            text.dirty = true;
+        if changed {
+            if let Some(text) = self.text.as_mut() {
+                text.dirty = true;
+            }
+            if let Some(text2) = self.text2.as_mut() {
+                text2.dirty = true;
+            }
         }
-        self.scroll = self.scroll.min(self.term.scrollback_len());
     }
 
     // -- scrolling ---------------------------------------------------------
@@ -865,25 +938,30 @@ impl App {
         let Some(text) = self.text.as_ref() else {
             return (0, 0);
         };
-        let col = ((x as f32 - self.config.padding) / text.cell_width)
-            .floor()
-            .max(0.0) as usize;
+        let pane_x = if self.focus_pane && self.split.is_some() {
+            let pane_w = self.pane_cols() as f32 * text.cell_width;
+            self.config.padding + pane_w + 2.0
+        } else {
+            self.config.padding
+        };
+        let col = ((x as f32 - pane_x) / text.cell_width).floor().max(0.0) as usize;
         let row =
             ((y as f32 - self.config.padding - self.tab_bar_h()) / text.line_height).floor() as i32;
-        (col.min(self.term.cols.saturating_sub(1)), row)
+        (col.min(self.active_term().cols.saturating_sub(1)), row)
     }
 
     /// Encode an xterm mouse report, or `None` when the application did not
     /// ask for mouse events. Shift is reserved for local selection/scrollback.
     fn mouse_report(&self, button: u8, release: bool) -> Option<Vec<u8>> {
-        if self.term.mouse_mode() == term::MouseMode::Off || self.modifiers.shift_key() {
+        let term = self.active_term();
+        if term.mouse_mode() == term::MouseMode::Off || self.modifiers.shift_key() {
             return None;
         }
         let (col, row) = self.pointer_cell;
         Some(encode_mouse_report(
             button,
             release,
-            self.term.mouse_sgr,
+            term.mouse_sgr,
             col,
             row,
             self.modifiers.alt_key(),
@@ -903,7 +981,7 @@ impl App {
         if self.scroll > 0 {
             return;
         }
-        match self.term.mouse_mode() {
+        match self.active_term().mouse_mode() {
             term::MouseMode::Move => {}
             term::MouseMode::Drag if self.mouse_down.is_some() => {}
             _ => return,
@@ -1276,79 +1354,69 @@ impl App {
         }
     }
 
+    // -- splits ------------------------------------------------------------
+
+    /// Columns each pane gets when split (one pane uses the full width).
+    fn pane_cols(&self) -> usize {
+        if self.split.is_some() {
+            (self.term.cols / 2).saturating_sub(1).max(1)
+        } else {
+            self.term.cols
+        }
+    }
+
+    fn toggle_split(&mut self) {
+        if self.split.take().is_some() {
+            // Collapse: drop the second shell; primary returns to full width.
+            self.focus_pane = false;
+        } else {
+            let (cols, rows) = (self.pane_cols(), self.term.rows);
+            let mut tab = TabState::new(&self.config);
+            tab.term.resize(cols, rows);
+            if let Some((writer, master, rx)) =
+                create_pty(cols, rows, self.width / 2, self.height, &self.proxy)
+            {
+                tab.pty_writer = Some(writer);
+                tab.pty_master = Some(master);
+                tab.rx = Some(rx);
+                self.split = Some(Box::new(tab));
+                self.focus_pane = true;
+            }
+        }
+        self.sync_size();
+        if let (Some(t), Some(t2)) = (self.text.as_mut(), self.text2.as_mut()) {
+            t.dirty = true;
+            t2.dirty = true;
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+        self.sync_window_title();
+    }
+
     // -- PTY ---------------------------------------------------------------
 
     fn spawn_pty(&mut self) {
-        // `GHOSTTY_WIN_SHELL` may include arguments, e.g. "pwsh.exe -NoLogo".
-        let shell_line =
-            std::env::var("GHOSTTY_WIN_SHELL").unwrap_or_else(|_| "powershell.exe".into());
-        let mut parts = shell_line.split_whitespace();
-        let shell = parts.next().unwrap_or("powershell.exe").to_string();
-        let mut cmd = CommandBuilder::new(&shell);
-        for arg in parts {
-            cmd.arg(arg);
-        }
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
-        cmd.cwd(std::env::current_dir().unwrap_or_default());
-
-        let pty_system = portable_pty::native_pty_system();
-        let pair = match pty_system.openpty(PtySize {
-            rows: self.term.rows as u16,
-            cols: self.term.cols as u16,
-            pixel_width: self.width as u16,
-            pixel_height: self.height as u16,
-        }) {
-            Ok(pair) => pair,
-            Err(err) => {
-                eprintln!("failed to open ConPTY: {err}");
-                return;
-            }
-        };
-
-        let mut reader = match pair.master.try_clone_reader() {
-            Ok(reader) => reader,
-            Err(err) => {
-                eprintln!("failed to clone ConPTY reader: {err}");
-                return;
-            }
-        };
-        self.pty_writer = pair.master.take_writer().ok();
-        self.pty_master = Some(pair.master);
-
-        let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = channel();
-        self.rx = Some(rx);
-        let proxy = self.proxy.clone();
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 8192];
-            loop {
-                match std::io::Read::read(&mut reader, &mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).is_err() {
-                            break;
-                        }
-                        if let Some(proxy) = proxy.as_ref() {
-                            let _ = proxy.send_event(UserEvent::Wake);
-                        }
-                    }
-                }
-            }
-            if let Some(proxy) = proxy.as_ref() {
-                let _ = proxy.send_event(UserEvent::Wake);
-            }
-        });
-
-        if let Err(err) = pair.slave.spawn_command(cmd) {
-            eprintln!("failed to spawn {shell}: {err}; falling back to cmd.exe");
-            let mut fallback = CommandBuilder::new("cmd.exe");
-            fallback.env("TERM", "xterm-256color");
-            let _ = pair.slave.spawn_command(fallback);
+        let (cols, rows) = (self.term.cols, self.term.rows);
+        if let Some((writer, master, rx)) =
+            create_pty(cols, rows, self.width, self.height, &self.proxy)
+        {
+            self.pty_writer = Some(writer);
+            self.pty_master = Some(master);
+            self.rx = Some(rx);
         }
     }
 
     fn write_pty(&mut self, bytes: &[u8]) {
-        if let Some(writer) = self.pty_writer.as_mut() {
+        let writer = if self.focus_pane {
+            self.split
+                .as_mut()
+                .and_then(|s| s.pty_writer.as_mut())
+                .or(self.pty_writer.as_mut())
+        } else {
+            self.pty_writer.as_mut()
+        };
+        if let Some(writer) = writer {
             use std::io::Write;
             let _ = writer.write_all(bytes);
             let _ = writer.flush();
@@ -1406,6 +1474,56 @@ impl App {
                 window.request_redraw();
             }
         }
+        // Second pane: drain its output and shape its rows.
+        if let Some(split) = self.split.as_mut() {
+            let mut chunks = Vec::new();
+            if let Some(rx) = split.rx.as_ref() {
+                while let Ok(chunk) = rx.try_recv() {
+                    chunks.push(chunk);
+                }
+            }
+            if !chunks.is_empty() {
+                let before = split.term.scrollback_len();
+                for chunk in &chunks {
+                    split.term.feed(&mut split.parser, chunk);
+                }
+                if split.scroll > 0 {
+                    let added = split.term.scrollback_len().saturating_sub(before);
+                    if added > 0 {
+                        split.scroll = (split.scroll + added).min(split.term.scrollback_len());
+                    }
+                }
+                if split.term.take_dirty() {
+                    for response in split.term.take_responses() {
+                        if let Some(writer) = split.pty_writer.as_mut() {
+                            use std::io::Write;
+                            let _ = writer.write_all(&response);
+                        }
+                    }
+                    for text in split.term.take_clipboard_writes() {
+                        set_clipboard(&text);
+                    }
+                    if split.term.take_clipboard_query() {
+                        let text = get_clipboard().unwrap_or_default();
+                        let reply =
+                            format!("\x1b]52;c;{}\x1b\\", term::base64_encode(text.as_bytes()));
+                        if let Some(writer) = split.pty_writer.as_mut() {
+                            use std::io::Write;
+                            let _ = writer.write_all(reply.as_bytes());
+                        }
+                    }
+                    for msg in split.term.take_notifications() {
+                        show_notification(&msg);
+                    }
+                    if let Some(t2) = self.text2.as_mut() {
+                        t2.dirty = true;
+                    }
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
+                }
+            }
+        }
     }
 
     // -- input -------------------------------------------------------------
@@ -1419,11 +1537,15 @@ impl App {
             b"".as_slice()
         };
 
-        let cursor_prefix: &[u8] = if self.term.app_cursor_keys {
-            b"\x1bO"
+        let app_cursor_keys = if self.focus_pane {
+            self.split
+                .as_ref()
+                .map(|s| s.term.app_cursor_keys)
+                .unwrap_or(self.term.app_cursor_keys)
         } else {
-            b"\x1b["
+            self.term.app_cursor_keys
         };
+        let cursor_prefix: &[u8] = if app_cursor_keys { b"\x1bO" } else { b"\x1b[" };
 
         let plain: Vec<u8> = match &key.logical_key {
             Key::Named(NamedKey::Enter) => b"\r".to_vec(),
@@ -1486,7 +1608,15 @@ impl App {
     fn bracket_paste(&mut self) {
         if let Some(text) = get_clipboard() {
             let normalized = text.replace("\r\n", "\r");
-            if self.term.bracketed_paste {
+            let bracketed = if self.focus_pane {
+                self.split
+                    .as_ref()
+                    .map(|s| s.term.bracketed_paste)
+                    .unwrap_or(self.term.bracketed_paste)
+            } else {
+                self.term.bracketed_paste
+            };
+            if bracketed {
                 self.write_pty(b"\x1b[200~");
                 self.write_pty(normalized.as_bytes());
                 self.write_pty(b"\x1b[201~");
@@ -1498,6 +1628,121 @@ impl App {
 
     // -- rendering ---------------------------------------------------------
 
+    /// Build cell backgrounds, underline/strikethrough, scrollbar and cursor
+    /// quads for one pane, offset horizontally within the window.
+    #[allow(clippy::too_many_arguments)]
+    fn push_pane_quads(
+        term: &Term,
+        scroll: usize,
+        x_off: f32,
+        y0: f32,
+        cell_w: f32,
+        line_h: f32,
+        focused: bool,
+        cursor_style: CursorStyle,
+        instances: &mut Vec<Quad>,
+    ) {
+        let cols = term.cols;
+        let rows = term.rows;
+        let top = term.scrollback_len().saturating_sub(scroll);
+        let bg = term.background();
+        for y in 0..rows {
+            let Some(line) = term.line(top + y) else {
+                continue;
+            };
+            for x in 0..cols {
+                let Some(cell) = line.get(x) else { continue };
+                if cell.bg != bg {
+                    instances.push(Quad {
+                        rect: [
+                            x_off + x as f32 * cell_w,
+                            y0 + y as f32 * line_h,
+                            cell_w,
+                            line_h,
+                        ],
+                        color: linear(cell.bg, 1.0),
+                    });
+                }
+                if cell.underline {
+                    instances.push(Quad {
+                        rect: [
+                            x_off + x as f32 * cell_w,
+                            y0 + y as f32 * line_h + line_h - 2.5,
+                            cell_w,
+                            1.5,
+                        ],
+                        color: linear(cell.fg, 1.0),
+                    });
+                }
+                if cell.strikethrough {
+                    instances.push(Quad {
+                        rect: [
+                            x_off + x as f32 * cell_w,
+                            y0 + y as f32 * line_h + line_h * 0.55,
+                            cell_w,
+                            1.5,
+                        ],
+                        color: linear(cell.fg, 1.0),
+                    });
+                }
+            }
+        }
+        // Scrollbar (only while scrolled back).
+        let history = term.scrollback_len();
+        if history > 0 && scroll > 0 {
+            let track_x = x_off + cols as f32 * cell_w - 4.0;
+            let track_h = rows as f32 * line_h;
+            instances.push(Quad {
+                rect: [track_x, y0, 4.0, track_h],
+                color: linear(term.foreground(), 0.10),
+            });
+            let visible_ratio = rows as f32 / term.total_lines() as f32;
+            let thumb_h = (track_h * visible_ratio).max(24.0).min(track_h);
+            let travel = track_h - thumb_h;
+            let pos = 1.0 - (scroll as f32 / history as f32);
+            instances.push(Quad {
+                rect: [track_x, y0 + travel * pos, 4.0, thumb_h],
+                color: linear(term.foreground(), 0.45),
+            });
+        }
+        // Cursor (only in the focused pane, at the live screen).
+        if term.cursor_visible && scroll == 0 && focused {
+            let (cx, cy) = term.cursor();
+            let x = x_off + cx as f32 * cell_w;
+            let y = y0 + cy as f32 * line_h;
+            let color = linear(term.foreground(), 0.9);
+            let t = CURSOR_THICKNESS;
+            match cursor_style {
+                CursorStyle::Block => instances.extend_from_slice(&[
+                    Quad {
+                        rect: [x, y, cell_w, t],
+                        color,
+                    },
+                    Quad {
+                        rect: [x, y + line_h - t, cell_w, t],
+                        color,
+                    },
+                    Quad {
+                        rect: [x, y, t, line_h],
+                        color,
+                    },
+                    Quad {
+                        rect: [x + cell_w - t, y, t, line_h],
+                        color,
+                    },
+                ]),
+                CursorStyle::Bar => instances.push(Quad {
+                    rect: [x, y, t, line_h],
+                    color,
+                }),
+                CursorStyle::Underline => instances.push(Quad {
+                    rect: [x, y + line_h - t, cell_w, t],
+                    color,
+                }),
+            }
+        }
+    }
+
     fn render(&mut self) {
         // Compute whole-self views before borrowing individual fields mutably.
         let bar_h = self.tab_bar_h();
@@ -1507,6 +1752,9 @@ impl App {
         let kitty_images: Vec<&term::KittyImage> = self.term.kitty_images().collect();
         let kitty_placements = self.term.kitty_placements().to_vec();
         let kitty_version = self.term.kitty_version;
+        let pane_cols = self.pane_cols();
+        let focus_pane = self.focus_pane;
+        let cursor_style = self.config.cursor_style;
         let (Some(gpu), Some(text), Some(quads), Some(images), Some(window)) = (
             self.gpu.as_ref(),
             self.text.as_mut(),
@@ -1535,53 +1783,49 @@ impl App {
         if text.dirty {
             text.rebuild(&self.term, self.scroll, surface_width, surface_height);
         }
-
-        // --- background quads + cursor quads ---
-        let top = self.term.scrollback_len().saturating_sub(self.scroll);
-        let mut instances: Vec<Quad> = Vec::new();
-        for y in 0..rows {
-            let line = self.term.line(top + y);
-            for x in 0..cols {
-                let Some(cell) = line.and_then(|line| line.get(x)) else {
-                    continue;
-                };
-                if cell.bg != self.term.background() {
-                    instances.push(Quad {
-                        rect: [
-                            padding + x as f32 * cell_w,
-                            y0 + y as f32 * line_h,
-                            cell_w,
-                            line_h,
-                        ],
-                        color: linear(cell.bg, 1.0),
-                    });
-                }
-                // glyphon has no underline/strikethrough support, so draw quads.
-                if cell.underline {
-                    instances.push(Quad {
-                        rect: [
-                            padding + x as f32 * cell_w,
-                            y0 + y as f32 * line_h + line_h - 2.5,
-                            cell_w,
-                            1.5,
-                        ],
-                        color: linear(cell.fg, 1.0),
-                    });
-                }
-                if cell.strikethrough {
-                    instances.push(Quad {
-                        rect: [
-                            padding + x as f32 * cell_w,
-                            y0 + y as f32 * line_h + (line_h * 0.55),
-                            cell_w,
-                            1.5,
-                        ],
-                        color: linear(cell.fg, 1.0),
-                    });
-                }
+        if let (Some(t2), Some(split)) = (self.text2.as_mut(), self.split.as_ref()) {
+            if t2.dirty {
+                t2.rebuild(&split.term, split.scroll, surface_width, surface_height);
             }
         }
-        // --- search match highlight ---
+
+        // --- panes ---
+        let top = self.term.scrollback_len().saturating_sub(self.scroll);
+        let mut instances: Vec<Quad> = Vec::new();
+        let x0 = padding;
+        let pane_w = pane_cols as f32 * cell_w;
+        let x1 = x0 + pane_w + 2.0;
+        let focus = window.has_focus();
+        Self::push_pane_quads(
+            &self.term,
+            self.scroll,
+            x0,
+            y0,
+            cell_w,
+            line_h,
+            !focus_pane && focus,
+            cursor_style,
+            &mut instances,
+        );
+        if let Some(split) = self.split.as_ref() {
+            Self::push_pane_quads(
+                &split.term,
+                split.scroll,
+                x1,
+                y0,
+                cell_w,
+                line_h,
+                focus_pane && focus,
+                cursor_style,
+                &mut instances,
+            );
+            // Divider between panes.
+            instances.push(Quad {
+                rect: [x0 + pane_w, y0, 2.0, self.term.rows as f32 * line_h],
+                color: linear(self.term.foreground(), 0.25),
+            });
+        }
+        // --- search match highlight (primary pane only) ---
         if let Some(search) = &self.search {
             if let Some(&(mline, mcol, mlen)) = search.matches.get(search.current) {
                 if mline >= top && mline < top + rows {
@@ -1657,65 +1901,7 @@ impl App {
             });
         }
         let bg_count = instances.len() as u32;
-
-        // The scrollbar only appears when there is history and only while
-        // scrolled away from the live screen (like Ghostty's overlay).
-        let history = self.term.scrollback_len();
-        if history > 0 && self.scroll > 0 {
-            let track_x = surface_width - padding - 4.0;
-            let track_h = rows as f32 * line_h;
-            let track_y = y0;
-            instances.push(Quad {
-                rect: [track_x, track_y, 4.0, track_h],
-                color: linear(self.term.foreground(), 0.10),
-            });
-            let visible_ratio = rows as f32 / self.term.total_lines() as f32;
-            let thumb_h = (track_h * visible_ratio).max(24.0).min(track_h);
-            let travel = track_h - thumb_h;
-            let pos = 1.0 - (self.scroll as f32 / history as f32);
-            instances.push(Quad {
-                rect: [track_x, track_y + travel * pos, 4.0, thumb_h],
-                color: linear(self.term.foreground(), 0.45),
-            });
-        }
-
-        let cursor_visible = self.term.cursor_visible && self.scroll == 0 && window.has_focus();
-        if cursor_visible {
-            let (cx, cy) = self.term.cursor();
-            let x = padding + cx as f32 * cell_w;
-            let y = y0 + cy as f32 * line_h;
-            let color = linear(self.term.foreground(), 0.9);
-            let t = CURSOR_THICKNESS;
-            match self.config.cursor_style {
-                CursorStyle::Block => instances.extend_from_slice(&[
-                    Quad {
-                        rect: [x, y, cell_w, t],
-                        color,
-                    },
-                    Quad {
-                        rect: [x, y + line_h - t, cell_w, t],
-                        color,
-                    },
-                    Quad {
-                        rect: [x, y, t, line_h],
-                        color,
-                    },
-                    Quad {
-                        rect: [x + cell_w - t, y, t, line_h],
-                        color,
-                    },
-                ]),
-                CursorStyle::Bar => instances.push(Quad {
-                    rect: [x, y, t, line_h],
-                    color,
-                }),
-                CursorStyle::Underline => instances.push(Quad {
-                    rect: [x, y + line_h - t, cell_w, t],
-                    color,
-                }),
-            }
-        }
-        let total = instances.len() as u32;
+        let total = bg_count;
 
         quads.upload(
             &gpu.device,
@@ -1764,13 +1950,24 @@ impl App {
             self.term.foreground()[2],
         );
         // One TextArea per row: rows keep their shaped buffers between frames.
+        let split_color = self
+            .split
+            .as_ref()
+            .map(|s| {
+                Color::rgb(
+                    s.term.foreground()[0],
+                    s.term.foreground()[1],
+                    s.term.foreground()[2],
+                )
+            })
+            .unwrap_or(default_color);
         let mut areas: Vec<TextArea> = text
             .rows
             .iter()
             .enumerate()
             .map(|(y, row)| TextArea {
                 buffer: &row.buffer,
-                left: padding,
+                left: x0,
                 top: y0 + y as f32 * text.line_height,
                 scale: 1.0,
                 bounds: TextBounds {
@@ -1783,6 +1980,22 @@ impl App {
                 custom_glyphs: &[],
             })
             .collect();
+        if let Some(t2) = self.text2.as_ref() {
+            areas.extend(t2.rows.iter().enumerate().map(|(y, row)| TextArea {
+                buffer: &row.buffer,
+                left: x1,
+                top: y0 + y as f32 * text.line_height,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: 0,
+                    top: 0,
+                    right: gpu.config.width as i32,
+                    bottom: gpu.config.height as i32,
+                },
+                default_color: split_color,
+                custom_glyphs: &[],
+            }));
+        }
         if bar_h > 0.0 {
             areas.push(TextArea {
                 buffer: &text.tab_buffer,
@@ -1890,6 +2103,7 @@ impl ApplicationHandler<UserEvent> for App {
         let scale = window.scale_factor() as f32;
         let config = self.config.clone();
         let text = Text::new(&gpu, scale, &config);
+        let text2 = Text::new(&gpu, scale, &config);
         let quads = QuadRenderer::new(&gpu.device, gpu.config.format);
         let images = ImageRenderer::new(&gpu.device, gpu.config.format);
 
@@ -1898,6 +2112,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.scale = scale;
         self.gpu = Some(gpu);
         self.text = Some(text);
+        self.text2 = Some(text2);
         self.quads = Some(quads);
         self.images = Some(images);
         self.window = Some(window);
@@ -2041,6 +2256,10 @@ impl ApplicationHandler<UserEvent> for App {
                             self.close_tab(event_loop);
                             return;
                         }
+                        if text.eq_ignore_ascii_case("s") {
+                            self.toggle_split();
+                            return;
+                        }
                     }
                     if matches!(event.logical_key, Key::Named(NamedKey::Tab)) {
                         self.switch_tab(-1);
@@ -2061,6 +2280,35 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         Key::Named(NamedKey::PageUp) => {
                             self.switch_tab(-1);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Alt+Arrow switches pane focus when split.
+                if self.split.is_some() && self.modifiers.alt_key() {
+                    match event.logical_key {
+                        Key::Named(NamedKey::ArrowLeft) => {
+                            self.focus_pane = false;
+                            if let (Some(t), Some(t2)) = (self.text.as_mut(), self.text2.as_mut()) {
+                                t.dirty = true;
+                                t2.dirty = true;
+                            }
+                            if let Some(window) = self.window.as_ref() {
+                                window.request_redraw();
+                            }
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowRight) => {
+                            self.focus_pane = true;
+                            if let (Some(t), Some(t2)) = (self.text.as_mut(), self.text2.as_mut()) {
+                                t.dirty = true;
+                                t2.dirty = true;
+                            }
+                            if let Some(window) = self.window.as_ref() {
+                                window.request_redraw();
+                            }
                             return;
                         }
                         _ => {}
@@ -2173,10 +2421,28 @@ impl ApplicationHandler<UserEvent> for App {
                 let Some(code) = mouse_button_code(button) else {
                     return;
                 };
+                // Clicks inside a pane focus that pane.
+                if let (ElementState::Pressed, Some((px, py))) = (&state, self.pointer_physical) {
+                    if self.split.is_some() && py >= self.tab_bar_h() as f64 {
+                        let cell_w = self.text.as_ref().map(|t| t.cell_width).unwrap_or(10.0);
+                        let pane_w = self.pane_cols() as f32 * cell_w;
+                        let in_right = px >= (self.config.padding + pane_w + 2.0) as f64;
+                        if in_right != self.focus_pane {
+                            self.focus_pane = in_right;
+                            if let (Some(t), Some(t2)) = (self.text.as_mut(), self.text2.as_mut()) {
+                                t.dirty = true;
+                                t2.dirty = true;
+                            }
+                            if let Some(window) = self.window.as_ref() {
+                                window.request_redraw();
+                            }
+                        }
+                    }
+                }
                 // The application gets the mouse unless Shift is held, which is
                 // the local override for selecting text.
-                let reports =
-                    self.term.mouse_mode() != term::MouseMode::Off && !self.modifiers.shift_key();
+                let reports = self.active_term().mouse_mode() != term::MouseMode::Off
+                    && !self.modifiers.shift_key();
                 // Clicks on the tab bar select a tab; middle-click closes one.
                 let bar_h = self.tab_bar_h();
                 if let (ElementState::Pressed, Some((px, py))) = (&state, self.pointer_physical) {
@@ -2390,6 +2656,85 @@ const SERVER_ADDR: &str = "127.0.0.1:17865";
 ///   NEW_WINDOW [shell]   -> OK   (spawns a GUI window, optionally with a shell line)
 ///   WINDOWS              -> <count>
 ///   QUIT                 -> OK   (stops the server)
+type PtyEnds = (
+    Box<dyn std::io::Write + Send>,
+    Box<dyn MasterPty + Send>,
+    Receiver<Vec<u8>>,
+);
+
+/// Spawn a shell on a fresh ConPTY, returning the writer, master and a channel
+/// that receives output chunks. `proxy` wakes the event loop on new output.
+fn create_pty(
+    cols: usize,
+    rows: usize,
+    pixel_w: u32,
+    pixel_h: u32,
+    proxy: &Option<EventLoopProxy<UserEvent>>,
+) -> Option<PtyEnds> {
+    let shell_line = std::env::var("GHOSTTY_WIN_SHELL").unwrap_or_else(|_| "powershell.exe".into());
+    let mut parts = shell_line.split_whitespace();
+    let shell = parts.next().unwrap_or("powershell.exe").to_string();
+    let mut cmd = CommandBuilder::new(&shell);
+    for arg in parts {
+        cmd.arg(arg);
+    }
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    cmd.cwd(std::env::current_dir().unwrap_or_default());
+
+    let pty_system = portable_pty::native_pty_system();
+    let pair = match pty_system.openpty(PtySize {
+        rows: rows as u16,
+        cols: cols as u16,
+        pixel_width: pixel_w as u16,
+        pixel_height: pixel_h as u16,
+    }) {
+        Ok(pair) => pair,
+        Err(err) => {
+            eprintln!("failed to open ConPTY: {err}");
+            return None;
+        }
+    };
+    let mut reader = match pair.master.try_clone_reader() {
+        Ok(reader) => reader,
+        Err(err) => {
+            eprintln!("failed to clone ConPTY reader: {err}");
+            return None;
+        }
+    };
+    let writer = pair.master.take_writer().ok()?;
+    let master = pair.master;
+
+    let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = channel();
+    let proxy = proxy.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match std::io::Read::read(&mut reader, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                    if let Some(proxy) = proxy.as_ref() {
+                        let _ = proxy.send_event(UserEvent::Wake);
+                    }
+                }
+            }
+        }
+        if let Some(proxy) = proxy.as_ref() {
+            let _ = proxy.send_event(UserEvent::Wake);
+        }
+    });
+    if let Err(err) = pair.slave.spawn_command(cmd) {
+        eprintln!("failed to spawn {shell}: {err}; falling back to cmd.exe");
+        let mut fallback = CommandBuilder::new("cmd.exe");
+        fallback.env("TERM", "xterm-256color");
+        let _ = pair.slave.spawn_command(fallback);
+    }
+    Some((writer, master, rx))
+}
+
 fn server_loop() {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;

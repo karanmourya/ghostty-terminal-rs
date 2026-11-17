@@ -119,6 +119,14 @@ with `clipboard-write = false` / `clipboard-read = false` in the config file.
 - A **visual tab bar** appears once a second tab exists: click a tab to switch, middle-click to close. With one tab it is hidden.
 - `--server`: minimal line-based daemon on `127.0.0.1:17865` — `PING`, `NEW_WINDOW [shell]`, `WINDOWS`, `QUIT`. `--new-window` asks it to spawn a window; `--send <command>` sends any command and prints the reply.
 
+## Splits
+
+**Ctrl+Shift+S** toggles a vertical side-by-side split: a second pane runs its
+own shell with independent scrollback and state. **Alt+Left / Alt+Right** or
+clicking a pane moves focus (the focused pane gets the cursor and keyboard
+input). Each pane has its own scrollbar; toggling the split back closes the
+second shell and restores the primary pane to full width.
+
 ## Kitty graphics
 
 The kitty graphics protocol is implemented: `a=T` transmit (`f=100` PNG / `f=32` RGBA, including multi-part `m=1` chunks), `a=p` place (cursor-relative `C`/`R`, `c`/`r` cell size, `z` stacking), and `a=d` delete — over both APC (`ESC _ G`) and DCS (`ESC P G`) forms. Images are decoded and uploaded as GPU textures, then drawn as quads behind the text.
@@ -127,7 +135,8 @@ The kitty graphics protocol is implemented: `a=T` transmit (`f=100` PNG / `f=32`
 
 ## What is missing (the honest list)
 
-- In-window pane splits (layout manager).
+- Arbitrary split layouts (nested/multiple panes, resizable dividers) — only one vertical two-pane split is supported.
+- Split-pane selection/search (selection and search operate on the primary pane only).
 - Kitty graphics end-to-end through ConPTY (blocked by Windows ConPTY, see above).
 - Full daemon/session protocol (the current daemon only spawns windows).
 
