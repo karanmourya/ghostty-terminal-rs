@@ -132,8 +132,13 @@ second shell and restores the primary pane to full width.
 Launch with **`--builtin`** (or `GHOSTTY_WIN_SHELL=ghostty-rs`) to use an in-process
 command runner whose output is fed straight into the terminal state machine —
 no ConPTY — so protocols ConPTY swallows work here. Type `help` for builtins:
-`echo`, `clear`, `kitty` (renders a real image), `osc8`, `notify`, `date`, `pwd`,
-`exit`. Unknown commands are still spawned on ConPTY, so normal programs
+`echo`, `clear`, `kitty`, `img`, `osc8`, `notify`, `date`, `pwd`, `exit`.
+
+**`img <file.png> [cols] [rows]`** renders any PNG via kitty graphics — quote
+paths with spaces, e.g. `img "C:\path\diagram.png" 100 34` (defaults: 80 cols,
+aspect-ratio-derived rows). This is how to display your own images.
+
+Unknown commands are still spawned on ConPTY, so normal programs
 (`git`, `cargo`, …) work as usual. Use **`pipe <command>`** to spawn on a raw
 pipe instead: the child's stdout/stderr bytes are fed straight into the
 terminal, so an external program CAN drive kitty graphics / OSC protocols —

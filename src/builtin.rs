@@ -20,6 +20,71 @@ pub enum CommandResult {
     Exit,
 }
 
+fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    // PNG IHDR: width at bytes 16..20, height at 20..24 (big-endian).
+    if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" {
+        return None;
+    }
+    let w = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let h = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    Some((w, h))
+}
+
+/// Read a PNG from disk and emit a kitty transmit + place sequence. The image
+/// is stretched to `cols x rows` cells; when omitted, rows follow the aspect
+/// ratio (terminal cells are about twice as tall as wide).
+fn img_command(args: &str) -> Vec<u8> {
+    // The path may be quoted because Windows paths often contain spaces.
+    let args = args.trim();
+    let (path, rest) = if let Some(rest) = args.strip_prefix('"') {
+        match rest.find('"') {
+            Some(end) => (&rest[..end], rest[end + 1..].trim()),
+            None => (args, ""),
+        }
+    } else if let Some(rest) = args.strip_prefix('\'') {
+        match rest.find('\'') {
+            Some(end) => (&rest[..end], rest[end + 1..].trim()),
+            None => (args, ""),
+        }
+    } else {
+        match args.split_once(char::is_whitespace) {
+            Some((p, r)) => (p, r.trim()),
+            None => (args, ""),
+        }
+    };
+    let mut words = rest.split_whitespace();
+    if path.is_empty() {
+        return b"usage: img <path.png> [cols] [rows]\r\n".to_vec();
+    }
+    let png = match std::fs::read(path) {
+        Ok(p) => p,
+        Err(err) => return format!("img: cannot read {path}: {err}\r\n").into_bytes(),
+    };
+    let (w, h) = match png_size(&png) {
+        Some(s) => s,
+        None => return b"img: not a PNG file\r\n".to_vec(),
+    };
+    let cols: u32 = words
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(80)
+        .clamp(1, 200);
+    let rows: u32 = words
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| ((cols as f64 * h as f64 / w as f64 / 2.0).round() as u32).clamp(1, 60))
+        .clamp(1, 60);
+    let b64 = base64_encode(&png);
+    let mut out = Vec::with_capacity(b64.len() + 96);
+    out.extend_from_slice(format!("\x1b_Ga=T,f=100,i=7,d={b64}\x1b\\").as_bytes());
+    out.extend_from_slice(format!("\x1b_Ga=p,i=7,c={cols},r={rows},C=1,R=1\x1b\\").as_bytes());
+    // Move below the image so the next prompt does not overlap.
+    for _ in 0..=rows {
+        out.extend_from_slice(b"\r\n");
+    }
+    out
+}
+
 fn kitty_demo() -> Vec<u8> {
     // 8x8 checkerboard in raw RGBA (f=32), so no PNG encoder is needed.
     let mut rgba = Vec::with_capacity(8 * 8 * 4);
@@ -58,8 +123,8 @@ pub fn run(line: &str) -> CommandResult {
     match cmd {
         "help" => {
             out.extend_from_slice(
-                b"builtins: help, echo <text>, clear, kitty, osc8 <url> <text>, \
-                  notify <text>, date, pwd, exit\r\n\
+                b"builtins: help, echo <text>, clear, kitty, img <file.png> [cols] [rows], \
+                  osc8 <url> <text>, notify <text>, date, pwd, exit\r\n\
                   pipe <cmd>  spawn on a raw pipe (preserves kitty APC/DCS)\r\n\
                   anything else is spawned on ConPTY\r\n",
             );
@@ -73,6 +138,9 @@ pub fn run(line: &str) -> CommandResult {
         }
         "kitty" => {
             out.extend_from_slice(&kitty_demo());
+        }
+        "img" => {
+            out.extend_from_slice(&img_command(rest));
         }
         "osc8" => {
             let mut words = rest.splitn(2, char::is_whitespace);
@@ -131,6 +199,23 @@ mod tests {
             img.rgba.iter().any(|&v| v != 0),
             "pixels should be non-empty"
         );
+    }
+
+    #[test]
+    fn img_command_embeds_png() {
+        let mut png = Vec::new();
+        image::RgbaImage::from_raw(1, 1, vec![0, 255, 0, 255])
+            .unwrap()
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let path = std::env::temp_dir().join("ghostty_test_img.png");
+        std::fs::write(&path, &png).unwrap();
+        let arg = format!("{} 80 3", path.to_string_lossy());
+        let out = img_command(&arg);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("\x1b_Ga=T,f=100,i=7,d="));
+        assert!(s.contains("\x1b_Ga=p,i=7,c=80,r=3,C=1,R=1\x1b\\"));
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
