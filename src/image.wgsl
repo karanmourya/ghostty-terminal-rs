@@ -38,7 +38,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VOut {
         1.0 - px.y / u.screen.y * 2.0,
     );
     var out: VOut;
-    out.position = vec4<f32>(ndc, 0.0, 0.0);
+    out.position = vec4<f32>(ndc, 0.0, 1.0);
     out.uv = inst.uv.xy + c * inst.uv.zw;
     out.tint = inst.tint;
     return out;

@@ -15,6 +15,7 @@
 //! source. See README.md for what is implemented and what still needs work
 //! before it can be called a Ghostty replacement.
 
+mod builtin;
 mod config;
 mod image_render;
 mod quad;
@@ -513,6 +514,21 @@ struct TabState {
     search: Option<SearchState>,
 }
 
+struct BuiltinShell {
+    line: String,
+    history: Vec<String>,
+    hist_idx: usize,
+    parser: vte::Parser,
+    child: Option<BuiltinChild>,
+}
+
+struct BuiltinChild {
+    // Kept alive so the ConPTY child process stays running.
+    _writer: Box<dyn std::io::Write + Send>,
+    _master: Box<dyn MasterPty + Send>,
+    rx: Receiver<Vec<u8>>,
+}
+
 impl TabState {
     fn new(config: &Config) -> Self {
         let mut term = Term::new(80, 24);
@@ -579,6 +595,8 @@ struct App {
     over_link: bool,
     /// Scrollback search mode (Ctrl+Shift+F).
     search: Option<SearchState>,
+    /// Built-in shell state (when running without ConPTY for direct feed).
+    builtin: Option<BuiltinShell>,
 
     /// Inactive tab sessions (active tab lives in the fields above).
     inactive_tabs: Vec<TabState>,
@@ -636,6 +654,7 @@ impl App {
             click_count: 0,
             over_link: false,
             search: None,
+            builtin: None,
             inactive_tabs: Vec::new(),
             active_tab: 0,
             split: None,
@@ -1374,7 +1393,7 @@ impl App {
             let mut tab = TabState::new(&self.config);
             tab.term.resize(cols, rows);
             if let Some((writer, master, rx)) =
-                create_pty(cols, rows, self.width / 2, self.height, &self.proxy)
+                create_pty(cols, rows, self.width / 2, self.height, None, &self.proxy)
             {
                 tab.pty_writer = Some(writer);
                 tab.pty_master = Some(master);
@@ -1394,12 +1413,210 @@ impl App {
         self.sync_window_title();
     }
 
+    // -- built-in shell ----------------------------------------------------
+
+    /// Bytes from our own commands go straight into the term state machine —
+    /// no ConPTY — so protocols ConPTY swallows (kitty graphics, etc.) work.
+    fn feed_direct(&mut self, bytes: &[u8]) {
+        if let Some(shell) = self.builtin.as_mut() {
+            self.term.feed(&mut shell.parser, bytes);
+        }
+        if let Some(text) = self.text.as_mut() {
+            text.dirty = true;
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+
+    fn builtin_start(&mut self) {
+        self.builtin = Some(BuiltinShell {
+            line: String::new(),
+            history: Vec::new(),
+            hist_idx: 0,
+            parser: vte::Parser::new(),
+            child: None,
+        });
+        self.feed_direct(b"ghostty-rs - built-in shell (type 'help')\r\n");
+        self.feed_direct(builtin::PROMPT.as_bytes());
+    }
+
+    fn builtin_replace_line(&mut self, line: &str) {
+        // Clear the current prompt+line, then redraw with the new text.
+        self.feed_direct(b"\r                                                                \r");
+        self.feed_direct(builtin::PROMPT.as_bytes());
+        self.feed_direct(line.as_bytes());
+    }
+
+    fn builtin_execute(&mut self) {
+        let line = {
+            let sh = self.builtin.as_mut().unwrap();
+            let line = std::mem::take(&mut sh.line);
+            sh.history.push(line.clone());
+            sh.hist_idx = sh.history.len();
+            line
+        };
+        self.feed_direct(b"\r\n");
+        match builtin::run(&line) {
+            builtin::CommandResult::Output(bytes) => {
+                self.feed_direct(&bytes);
+                self.feed_direct(builtin::PROMPT.as_bytes());
+            }
+            builtin::CommandResult::External(cmd) => {
+                let (cols, rows) = (self.term.cols, self.term.rows);
+                match create_pty(cols, rows, self.width, self.height, Some(&cmd), &self.proxy) {
+                    Some((writer, master, rx)) => {
+                        self.builtin.as_mut().unwrap().child = Some(BuiltinChild {
+                            _writer: writer,
+                            _master: master,
+                            rx,
+                        });
+                    }
+                    None => {
+                        self.feed_direct(b"failed to spawn command\r\n");
+                        self.feed_direct(builtin::PROMPT.as_bytes());
+                    }
+                }
+            }
+            builtin::CommandResult::Exit => {
+                self.feed_direct(b"exit - close the window to quit\r\n");
+                self.feed_direct(builtin::PROMPT.as_bytes());
+            }
+        }
+    }
+
+    /// Handle a key for the built-in shell. Returns true when consumed.
+    fn builtin_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        let ctrl = self.modifiers.control_key();
+        let alt = self.modifiers.alt_key();
+        match &event.logical_key {
+            Key::Named(NamedKey::Enter) => {
+                self.builtin_execute();
+                return true;
+            }
+            Key::Named(NamedKey::Backspace) => {
+                let had = self
+                    .builtin
+                    .as_mut()
+                    .is_some_and(|sh| sh.line.pop().is_some());
+                if had {
+                    self.feed_direct(b"\x08 \x08");
+                }
+                return true;
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                let line = {
+                    let sh = self.builtin.as_mut().unwrap();
+                    if sh.hist_idx > 0 {
+                        sh.hist_idx -= 1;
+                        Some(sh.history[sh.hist_idx].clone())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(line) = line {
+                    self.builtin_replace_line(&line);
+                }
+                return true;
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                let line = {
+                    let sh = self.builtin.as_mut().unwrap();
+                    if sh.hist_idx + 1 < sh.history.len() {
+                        sh.hist_idx += 1;
+                        Some(sh.history[sh.hist_idx].clone())
+                    } else {
+                        sh.hist_idx = sh.history.len();
+                        Some(String::new())
+                    }
+                };
+                if let Some(line) = line {
+                    self.builtin_replace_line(&line);
+                }
+                return true;
+            }
+            _ => {}
+        }
+        if ctrl && !alt {
+            match &event.logical_key {
+                Key::Character(t) if t.eq_ignore_ascii_case("c") => {
+                    self.builtin.as_mut().unwrap().line.clear();
+                    self.feed_direct(b"^C\r\n");
+                    self.feed_direct(builtin::PROMPT.as_bytes());
+                    return true;
+                }
+                Key::Character(t) if t.eq_ignore_ascii_case("v") => {
+                    if let Some(text) = get_clipboard() {
+                        for ch in text.chars() {
+                            if ch == '\n' {
+                                continue;
+                            }
+                            self.builtin.as_mut().unwrap().line.push(ch);
+                            self.feed_direct(ch.to_string().as_bytes());
+                        }
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        if !ctrl && !alt {
+            if let Key::Character(text) = &event.logical_key {
+                for ch in text.chars() {
+                    if !ch.is_control() {
+                        self.builtin.as_mut().unwrap().line.push(ch);
+                        self.feed_direct(ch.to_string().as_bytes());
+                    }
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Drain output from a ConPTY-launched external command into our term.
+    fn builtin_drain(&mut self) {
+        let done = {
+            let Some(sh) = self.builtin.as_mut() else {
+                return;
+            };
+            let Some(child) = sh.child.as_mut() else {
+                return;
+            };
+            let parser = &mut sh.parser;
+            let mut done = false;
+            loop {
+                match child.rx.try_recv() {
+                    Ok(chunk) => self.term.feed(parser, &chunk),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            done
+        };
+        if done {
+            self.builtin.as_mut().unwrap().child = None;
+            self.feed_direct(b"\r\n");
+            self.feed_direct(builtin::PROMPT.as_bytes());
+        } else {
+            if let Some(text) = self.text.as_mut() {
+                text.dirty = true;
+            }
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
+        }
+    }
+
     // -- PTY ---------------------------------------------------------------
 
     fn spawn_pty(&mut self) {
         let (cols, rows) = (self.term.cols, self.term.rows);
         if let Some((writer, master, rx)) =
-            create_pty(cols, rows, self.width, self.height, &self.proxy)
+            create_pty(cols, rows, self.width, self.height, None, &self.proxy)
         {
             self.pty_writer = Some(writer);
             self.pty_master = Some(master);
@@ -2118,13 +2335,22 @@ impl ApplicationHandler<UserEvent> for App {
         self.window = Some(window);
 
         self.sync_size();
-        self.spawn_pty();
+        if self.builtin.is_some() {
+            self.builtin_start();
+        } else {
+            self.spawn_pty();
+        }
         event_loop.set_control_flow(ControlFlow::Wait);
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Wake => self.drain_pty(),
+            UserEvent::Wake => {
+                self.drain_pty();
+                if self.builtin.is_some() {
+                    self.builtin_drain();
+                }
+            }
         }
     }
 
@@ -2316,7 +2542,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 // Ctrl+V pastes; Ctrl+Shift+V is the same thing for muscle memory.
-                if self.modifiers.control_key() {
+                if self.modifiers.control_key() && self.builtin.is_none() {
                     if let Key::Character(text) = &event.logical_key {
                         if text.eq_ignore_ascii_case("v") {
                             self.jump_to_bottom();
@@ -2324,6 +2550,10 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
                     }
+                }
+                // Built-in shell consumes its own keys before PTY encoding.
+                if self.builtin.is_some() && self.builtin_key(&event) {
+                    return;
                 }
                 if let Some(bytes) = self.encode_key(&event) {
                     // Typing always returns to the live screen, but modifier-only
@@ -2669,9 +2899,13 @@ fn create_pty(
     rows: usize,
     pixel_w: u32,
     pixel_h: u32,
+    shell_override: Option<&str>,
     proxy: &Option<EventLoopProxy<UserEvent>>,
 ) -> Option<PtyEnds> {
-    let shell_line = std::env::var("GHOSTTY_WIN_SHELL").unwrap_or_else(|_| "powershell.exe".into());
+    let shell_line = shell_override
+        .map(str::to_string)
+        .or_else(|| std::env::var("GHOSTTY_WIN_SHELL").ok())
+        .unwrap_or_else(|| "powershell.exe".into());
     let mut parts = shell_line.split_whitespace();
     let shell = parts.next().unwrap_or("powershell.exe").to_string();
     let mut cmd = CommandBuilder::new(&shell);
@@ -2837,6 +3071,28 @@ fn main() {
 
     let mut app = App::new();
     app.proxy = Some(proxy);
+    // Built-in mode: `--builtin` or GHOSTTY_WIN_SHELL=ghostty-rs. Our own
+    // commands are fed directly; unknown ones are still spawned via ConPTY.
+    let builtin_mode = args.iter().any(|a| a == "--builtin")
+        || std::env::var("GHOSTTY_WIN_SHELL")
+            .map(|s| s == "ghostty-rs")
+            .unwrap_or(false);
+    if builtin_mode {
+        // Ensure external-command spawns don't inherit the sentinel shell.
+        if std::env::var("GHOSTTY_WIN_SHELL")
+            .map(|s| s == "ghostty-rs")
+            .unwrap_or(false)
+        {
+            std::env::remove_var("GHOSTTY_WIN_SHELL");
+        }
+        app.builtin = Some(BuiltinShell {
+            line: String::new(),
+            history: Vec::new(),
+            hist_idx: 0,
+            parser: vte::Parser::new(),
+            child: None,
+        });
+    }
 
     if let Err(err) = event_loop.run_app(&mut app) {
         eprintln!("event loop failed: {err}");

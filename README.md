@@ -127,17 +127,27 @@ clicking a pane moves focus (the focused pane gets the cursor and keyboard
 input). Each pane has its own scrollbar; toggling the split back closes the
 second shell and restores the primary pane to full width.
 
+## Built-in shell (direct feed)
+
+Launch with **`--builtin`** (or `GHOSTTY_WIN_SHELL=ghostty-rs`) to use an in-process
+command runner whose output is fed straight into the terminal state machine —
+no ConPTY — so protocols ConPTY swallows work here. Type `help` for builtins:
+`echo`, `clear`, `kitty` (renders a real image), `osc8`, `notify`, `date`, `pwd`,
+`exit`. Unknown commands are still spawned on ConPTY, so normal programs
+(`git`, `cargo`, …) work as usual — they just can't drive ConPTY-swallowed
+protocols. Arrow keys recall history; Ctrl+C cancels the line.
+
 ## Kitty graphics
 
-The kitty graphics protocol is implemented: `a=T` transmit (`f=100` PNG / `f=32` RGBA, including multi-part `m=1` chunks), `a=p` place (cursor-relative `C`/`R`, `c`/`r` cell size, `z` stacking), and `a=d` delete — over both APC (`ESC _ G`) and DCS (`ESC P G`) forms. Images are decoded and uploaded as GPU textures, then drawn as quads behind the text.
+The kitty graphics protocol is implemented: `a=T` transmit (`f=100` PNG / `f=32` RGBA, including multi-part `m=1` chunks), `a=p` place (cursor-relative `C`/`R`, `c`/`r` cell size, `z` stacking), and `a=d` delete — over both APC (`ESC _ G`) and DCS (`ESC P G`) forms. Images are decoded and uploaded as GPU textures, then drawn as quads behind the text. Verified end-to-end with the built-in `kitty` command.
 
-**Windows limitation:** ConPTY (the Windows pseudo-terminal backend) consumes APC/DCS string sequences and does not forward them to the terminal, so kitty graphics cannot be driven through a ConPTY-backed shell here. The parser and renderer are unit-tested (`kitty_apc_transmit_and_place`, `kitty_dcs_transmit`); end-to-end display needs a PTY backend that forwards APC/DCS.
+**Windows limitation:** ConPTY consumes APC/DCS string sequences and does not forward them, so kitty graphics cannot be driven by an external ConPTY-backed program. Use the built-in shell (`--builtin`) for a direct-feed path where they work. Parser and renderer are unit-tested (`kitty_apc_transmit_and_place`, `kitty_dcs_transmit`, `kitty_demo_feeds_into_term`).
 
 ## What is missing (the honest list)
 
 - Arbitrary split layouts (nested/multiple panes, resizable dividers) — only one vertical two-pane split is supported.
 - Split-pane selection/search (selection and search operate on the primary pane only).
-- Kitty graphics end-to-end through ConPTY (blocked by Windows ConPTY, see above).
+- Kitty graphics from external ConPTY programs (blocked by Windows ConPTY; works via the built-in shell).
 - Full daemon/session protocol (the current daemon only spawns windows).
 
 ## Architecture
