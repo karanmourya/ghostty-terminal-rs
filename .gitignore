@@ -1,4 +1,5 @@
 /target
+*.pdb
 *.png
 run.err.log
 run.out.log
