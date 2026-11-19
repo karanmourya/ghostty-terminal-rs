@@ -520,6 +520,16 @@ struct BuiltinShell {
     hist_idx: usize,
     parser: vte::Parser,
     child: Option<BuiltinChild>,
+    pipe: Option<PipeSession>,
+}
+
+struct PipeSession {
+    rx: Receiver<PipeEvent>,
+}
+
+enum PipeEvent {
+    Data(Vec<u8>),
+    Done,
 }
 
 struct BuiltinChild {
@@ -1436,6 +1446,7 @@ impl App {
             hist_idx: 0,
             parser: vte::Parser::new(),
             child: None,
+            pipe: None,
         });
         self.feed_direct(b"ghostty-rs - built-in shell (type 'help')\r\n");
         self.feed_direct(builtin::PROMPT.as_bytes());
@@ -1478,11 +1489,88 @@ impl App {
                     }
                 }
             }
+            builtin::CommandResult::Pipe(cmd) => {
+                self.spawn_pipe(&cmd);
+            }
             builtin::CommandResult::Exit => {
                 self.feed_direct(b"exit - close the window to quit\r\n");
                 self.feed_direct(builtin::PROMPT.as_bytes());
             }
         }
+    }
+
+    /// Spawn a command on a raw pipe (cmd.exe /C) so its stdout/stderr bytes
+    /// reach us unmodified — this is the "way out" for escape sequences that
+    /// ConPTY consumes (kitty graphics APC/DCS, etc.).
+    fn spawn_pipe(&mut self, command: &str) {
+        use std::process::Stdio;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let mut child = match std::process::Command::new("cmd")
+            .args(["/D", "/C", command])
+            .env("TERM", "xterm-256color")
+            .env("COLORTERM", "truecolor")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(err) => {
+                self.feed_direct(format!("pipe spawn failed: {err}\r\n").as_bytes());
+                self.feed_direct(builtin::PROMPT.as_bytes());
+                return;
+            }
+        };
+        let streams: Vec<Box<dyn std::io::Read + Send>> = [
+            child
+                .stdout
+                .take()
+                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+            child
+                .stderr
+                .take()
+                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let (tx, rx) = channel::<PipeEvent>();
+        let outstanding = Arc::new(AtomicUsize::new(streams.len()));
+        let proxy = self.proxy.clone();
+        for mut stream in streams {
+            let tx = tx.clone();
+            let done = outstanding.clone();
+            let proxy = proxy.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match std::io::Read::read(&mut stream, &mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if tx.send(PipeEvent::Data(buf[..n].to_vec())).is_err() {
+                                break;
+                            }
+                            if let Some(proxy) = proxy.as_ref() {
+                                let _ = proxy.send_event(UserEvent::Wake);
+                            }
+                        }
+                    }
+                }
+                if done.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    let _ = tx.send(PipeEvent::Done);
+                    if let Some(proxy) = proxy.as_ref() {
+                        let _ = proxy.send_event(UserEvent::Wake);
+                    }
+                }
+            });
+        }
+        // Do not block the UI thread waiting for the child; reap it on Done.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        self.builtin.as_mut().unwrap().pipe = Some(PipeSession { rx });
     }
 
     /// Handle a key for the built-in shell. Returns true when consumed.
@@ -1574,34 +1662,66 @@ impl App {
         false
     }
 
-    /// Drain output from a ConPTY-launched external command into our term.
+    /// Drain output from a ConPTY- or pipe-launched command into our term.
     fn builtin_drain(&mut self) {
-        let done = {
-            let Some(sh) = self.builtin.as_mut() else {
-                return;
-            };
-            let Some(child) = sh.child.as_mut() else {
-                return;
-            };
-            let parser = &mut sh.parser;
-            let mut done = false;
-            loop {
-                match child.rx.try_recv() {
-                    Ok(chunk) => self.term.feed(parser, &chunk),
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        done = true;
-                        break;
+        use std::sync::mpsc::TryRecvError;
+        // ConPTY child. `None` means no child session is active.
+        let conpty_done = {
+            let sh = self.builtin.as_mut().unwrap();
+            if sh.child.is_none() {
+                None
+            } else {
+                let child = sh.child.as_mut().unwrap();
+                let parser = &mut sh.parser;
+                let mut done = false;
+                loop {
+                    match child.rx.try_recv() {
+                        Ok(chunk) => self.term.feed(parser, &chunk),
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            done = true;
+                            break;
+                        }
                     }
                 }
+                Some(done)
             }
-            done
         };
-        if done {
-            self.builtin.as_mut().unwrap().child = None;
+        // Raw pipe: bytes are fed verbatim, so APC/DCS survive ConPTY.
+        let pipe_done = {
+            let sh = self.builtin.as_mut().unwrap();
+            if sh.pipe.is_none() {
+                None
+            } else {
+                let pipe = sh.pipe.as_mut().unwrap();
+                let parser = &mut sh.parser;
+                let mut done = false;
+                loop {
+                    match pipe.rx.try_recv() {
+                        Ok(PipeEvent::Data(chunk)) => self.term.feed(parser, &chunk),
+                        Ok(PipeEvent::Done) => {
+                            done = true;
+                            break;
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            done = true;
+                            break;
+                        }
+                    }
+                }
+                Some(done)
+            }
+        };
+        let finished = conpty_done == Some(true) || pipe_done == Some(true);
+        let had_session = conpty_done.is_some() || pipe_done.is_some();
+        if finished {
+            let sh = self.builtin.as_mut().unwrap();
+            sh.child = None;
+            sh.pipe = None;
             self.feed_direct(b"\r\n");
             self.feed_direct(builtin::PROMPT.as_bytes());
-        } else {
+        } else if had_session {
             if let Some(text) = self.text.as_mut() {
                 text.dirty = true;
             }
@@ -3091,6 +3211,7 @@ fn main() {
             hist_idx: 0,
             parser: vte::Parser::new(),
             child: None,
+            pipe: None,
         });
     }
 

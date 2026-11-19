@@ -134,8 +134,11 @@ command runner whose output is fed straight into the terminal state machine —
 no ConPTY — so protocols ConPTY swallows work here. Type `help` for builtins:
 `echo`, `clear`, `kitty` (renders a real image), `osc8`, `notify`, `date`, `pwd`,
 `exit`. Unknown commands are still spawned on ConPTY, so normal programs
-(`git`, `cargo`, …) work as usual — they just can't drive ConPTY-swallowed
-protocols. Arrow keys recall history; Ctrl+C cancels the line.
+(`git`, `cargo`, …) work as usual. Use **`pipe <command>`** to spawn on a raw
+pipe instead: the child's stdout/stderr bytes are fed straight into the
+terminal, so an external program CAN drive kitty graphics / OSC protocols —
+this is the "way out" for ConPTY-swallowed sequences. Arrow keys recall
+history; Ctrl+C cancels the line.
 
 ## Kitty graphics
 
@@ -147,7 +150,7 @@ The kitty graphics protocol is implemented: `a=T` transmit (`f=100` PNG / `f=32`
 
 - Arbitrary split layouts (nested/multiple panes, resizable dividers) — only one vertical two-pane split is supported.
 - Split-pane selection/search (selection and search operate on the primary pane only).
-- Kitty graphics from external ConPTY programs (blocked by Windows ConPTY; works via the built-in shell).
+- Kitty graphics from external ConPTY programs (blocked by Windows ConPTY; use `pipe <cmd>` or the built-in shell instead).
 - Full daemon/session protocol (the current daemon only spawns windows).
 
 ## Architecture

@@ -10,8 +10,12 @@ pub const PROMPT: &str = "\x1b[32mghostty-rs\x1b[0m> ";
 pub enum CommandResult {
     /// Bytes to feed directly into the terminal.
     Output(Vec<u8>),
-    /// A command line the caller should spawn on a ConPTY.
+    /// A command line the caller should spawn on a ConPTY (full TTY semantics).
     External(String),
+    /// A command line to spawn on a raw pipe. The child's stdout/stderr bytes
+    /// are fed straight into the terminal, so escape sequences ConPTY would
+    /// swallow (APC/DCS kitty graphics, etc.) survive.
+    Pipe(String),
     /// Leave the built-in shell.
     Exit,
 }
@@ -48,11 +52,15 @@ pub fn run(line: &str) -> CommandResult {
     let cmd = parts.next().unwrap_or("");
     let rest = parts.next().unwrap_or("").trim();
     let mut out = Vec::new();
+    if cmd == "pipe" {
+        return CommandResult::Pipe(rest.to_string());
+    }
     match cmd {
         "help" => {
             out.extend_from_slice(
                 b"builtins: help, echo <text>, clear, kitty, osc8 <url> <text>, \
                   notify <text>, date, pwd, exit\r\n\
+                  pipe <cmd>  spawn on a raw pipe (preserves kitty APC/DCS)\r\n\
                   anything else is spawned on ConPTY\r\n",
             );
         }
@@ -142,6 +150,10 @@ mod tests {
         match run("git status") {
             CommandResult::External(c) => assert_eq!(c, "git status"),
             _ => panic!("unknown command should be external"),
+        }
+        match run("pipe echo hi") {
+            CommandResult::Pipe(c) => assert_eq!(c, "echo hi"),
+            _ => panic!("pipe command should use raw pipe"),
         }
     }
 }
